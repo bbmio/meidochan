@@ -133,7 +133,7 @@ class ImageSource(MediaSource):
         self.spec.style = style
         self.refresh(fast=True)
 
-    def set_state(self, state: AgentState) -> None:
+    def set_state(self, state: AgentState, skip_expression: bool = False) -> None:
         # 静态图忽略状态（动效实现接管此处即可驱动动画）
         return None
 

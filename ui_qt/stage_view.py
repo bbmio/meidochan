@@ -99,13 +99,18 @@ class StageView(QWidget):
         self._layers[slot] = None
         return source
 
-    def on_agent_state(self, state: AgentState) -> None:
-        """引擎 AGENT_* 事件 → 分发到所有层（M1 静态图忽略，链路必须打通）。"""
+    def on_agent_state(self, state: AgentState,
+                       skip_expression: bool = False) -> None:
+        """引擎 AGENT_* 事件 → 分发到所有层（M1 静态图忽略，链路必须打通）。
+
+        `skip_expression=True` 时透传给各层（只有 Live2D 层在意）：AI 显式设的
+        表情正处于保持期，不该被状态机的映射覆盖。
+        """
         self._state = state
         for src in self._layers.values():
             if src is not None:
                 try:
-                    src.set_state(state)
+                    src.set_state(state, skip_expression=skip_expression)
                 except Exception:
                     pass
 

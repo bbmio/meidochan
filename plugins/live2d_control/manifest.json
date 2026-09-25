@@ -1,0 +1,15 @@
+{
+    "name": "live2d_control",
+    "version": "1.0.0",
+    "type": "tool",
+    "entry": "main.py",
+    "author": "ShiKi",
+    "description": "让 AI 主动控制桌面立绘：切换表情、播放动作、回到默认脸。可用名字由模型目录实时扫描得出（core/live2d_assets），与设置界面下拉框、播放器 manifest 同一份定义。",
+
+    "# 工具定义方式": "不用下面的 tools 数组，而是在 main.py 里实现 get_dynamic_tools()——工具说明要列出当前模型的实际表情/动作名（自带模型 44 个表情），静态 JSON 写不了，只能运行时生成。执行侧配套 owns_tool() + call_dynamic_tool()。",
+    "# 注意": "本文件是 JSON，不支持注释。上面这些说明只能写成「键: 值」的形式，值不能省。",
+
+    "config": {
+        "enabled": true
+    }
+}

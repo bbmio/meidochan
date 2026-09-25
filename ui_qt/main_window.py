@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from core.app_info import APP_DISPLAY, APP_VERSION, APP_NAME
 from core.brain import request_stop
+from core import live2d_control
 from core.config.models import AppearanceConfig
 from core.logging_utils import log, log_file
 from core.paths import APP_DIR, app_path
@@ -164,6 +165,18 @@ class MainWindow(QWidget):
         self._agent_tracker = AgentStateTracker()
         self._live2d = None
         self._live2d_watch: Optional[QTimer] = None
+        #: AI 显式设的表情的「保持期」——期间跳过状态驱动的表情切换，
+        #: 否则工具一返回、阶段变成 writing，表情立刻被换成「画笔」，等于白设。
+        self._live2d_hold = False
+        self._live2d_hold_release = QTimer(self)
+        self._live2d_hold_release.setSingleShot(True)
+        self._live2d_hold_release.setInterval(1500)   # 回复很短时留一点时间让表情被看见
+        self._live2d_hold_release.timeout.connect(self._release_live2d_hold)
+        #: 把 AI 写的立绘请求从 core 的队列搬到 GUI 线程（工具线程不能碰 Qt 对象）
+        self._live2d_pump = QTimer(self)
+        self._live2d_pump.setInterval(150)
+        self._live2d_pump.timeout.connect(self._drain_live2d_requests)
+        self._live2d_pump.start()
         self._stand_window: Optional[Live2DWindow] = None
         self._desktop_chat: Optional[DesktopChatWindow] = None
         self._bubble: Optional[SpeechBubble] = None
@@ -425,20 +438,73 @@ class MainWindow(QWidget):
 
         不做「最短停留」：状态到了就切。动作本身是一次性的会自己播完，
         状态则会一直保持到下一个阶段，所以长回复的「输出中」自然持续到结束。
+
+        AI 显式设的表情处于保持期时**只播动作、不动表情**（见 `_live2d_hold`）。
         """
         state = self._agent_tracker.feed_phase(phase)
         if state is not None:
-            self._sync_agent_state(state)
+            self._sync_agent_state(state, skip_expression=self._live2d_hold)
 
-    def _sync_agent_state(self, state) -> None:
+    def _sync_agent_state(self, state, skip_expression: bool = False) -> None:
         if state is None:
             return
         # 立绘独立到桌面后就不在舞台的层登记表里了，StageView.on_agent_state()
         # 够不着它 —— 这里直接补一路给它，否则表情不再随对话状态变化。
         window = self._stand_window
         if window is not None and window.isVisible() and window.source is not None:
-            window.source.set_state(state)
-        self.stage.on_agent_state(state)
+            window.source.set_state(state, skip_expression=skip_expression)
+        self.stage.on_agent_state(state, skip_expression=skip_expression)
+
+    # ── AI 主动控制立绘 ──
+
+    def _drain_live2d_requests(self) -> None:
+        """把 AI 写的立绘请求从 core 的队列搬到 GUI 线程执行。
+
+        工具跑在 worker 线程，直接碰 Qt 对象会崩 —— 所以插件只往
+        `core/live2d_control` 的队列里塞一条请求，由这个定时器搬运。
+        150ms 的延迟对表情切换无感。
+        """
+        items = live2d_control.take_pending()
+        if not items:
+            return
+        for kind, value in items:
+            self._apply_live2d_command(kind, value)
+            if kind in (live2d_control.KIND_EXPRESSION, live2d_control.KIND_CLEAR):
+                # 进入保持期：本轮剩余阶段不再用 state_map 覆盖表情
+                self._live2d_hold = True
+                self._live2d_hold_release.stop()
+
+    def _apply_live2d_command(self, kind: str, value: str) -> None:
+        for source in self._live2d_targets():
+            try:
+                if kind == live2d_control.KIND_EXPRESSION:
+                    source.set_expression(value)
+                elif kind == live2d_control.KIND_MOTION:
+                    source.play_motion(value)
+                elif kind == live2d_control.KIND_CLEAR:
+                    source.clear_expression()
+            except Exception as exc:
+                print(f"[UI] 执行立绘指令失败（{kind}={value}）：{exc}")
+
+    def _live2d_targets(self) -> list:
+        """当前在显示的立绘源（独立窗口优先，否则舞台上的那个）。"""
+        targets = []
+        window = self._stand_window
+        if window is not None and window.isVisible() and window.source is not None:
+            targets.append(window.source)
+        if self._live2d is not None and self._live2d not in targets:
+            targets.append(self._live2d)
+        return targets
+
+    def _release_live2d_hold(self) -> None:
+        """保持期结束：回到由对话状态驱动的表情。
+
+        ⚠️ 这里**必须**用 `self._agent_tracker.reset()` 而不是直接
+        `_sync_agent_state(AgentState.IDLE)` —— 见 `_on_response_finished`
+        里为什么不能在回合结束时提前 reset。
+        """
+        self._live2d_hold = False
+        self._sync_agent_state(self._agent_tracker.reset())
 
     def _check_live2d_ready(self) -> None:
         """轮询 Live2D 就绪状态，把加载中/失败如实反馈到侧栏。"""
@@ -1211,7 +1277,14 @@ class MainWindow(QWidget):
             self._bubble.hold_then_hide()
         if self._stand_window is not None:
             self._stand_window.set_input_enabled(True)
-        self._sync_agent_state(self._agent_tracker.reset())
+        # ⚠️ 保持期内**不能**在这里先调 tracker.reset()：它会把状态置为 IDLE，
+        # 之后定时器里再 reset() 就返回 None（状态无变化），
+        # _sync_agent_state(None) 直接 early-return —— AI 设的表情永远回不去。
+        # 所以推迟到定时器里一次性完成。
+        if self._live2d_hold:
+            self._live2d_hold_release.start()
+        else:
+            self._sync_agent_state(self._agent_tracker.reset())
         self.refresh_sessions()
 
     def _on_response_failed(self, message: str) -> None:
@@ -1221,6 +1294,7 @@ class MainWindow(QWidget):
             self._desktop_chat.fail(message)
         if self._stand_window is not None:
             self._stand_window.set_input_enabled(True)
+        self._live2d_hold = False      # 出错就直接恢复正常，不留保持期
         self._sync_agent_state(self._agent_tracker.fail())
         self.sidebar.set_status("生成失败，详见控制台日志")
         print(f"[UI] respond 失败：{message}")

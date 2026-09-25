@@ -141,12 +141,46 @@ class Live2DSource(MediaSource):
         self.spec.style = style
         self.refresh(fast=True)
 
-    def set_state(self, state: AgentState) -> None:
-        if state == self._last_state:
+    def set_state(self, state: AgentState, skip_expression: bool = False) -> None:
+        """按对话状态切换动作 / 表情（映射表在 config/live2d.toml 的 state_map）。
+
+        `skip_expression=True` 时**只播动作、不动表情** —— AI 显式设的表情
+        正处于保持期，不该被状态机覆盖（见 main_window 的保持期逻辑）。
+        """
+        if state == self._last_state and not skip_expression:
             return
         self._last_state = state
-        # 交给页面里的 stateMap 决定用哪个动作/表情（映射表在 config/live2d.toml）
-        self._js(f"MeidoLive2D.setState({json.dumps(state.value)});")
+        self._js("MeidoLive2D.setState(%s, %s);" % (
+            json.dumps(state.value), "true" if skip_expression else "false"))
+
+    # ── AI 主动控制 ──
+    # 由 plugins/live2d_control 写请求 → core/live2d_control 队列 → main_window
+    # 在 GUI 线程取走并调到这里。**不要**在工具线程直接调这些方法。
+    #
+    # 名字一律走 _js_string 转义：动作/表情名来自模型目录的文件名，
+    # 是不可控输入，直接拼进 JS 会被引号或反斜杠拼坏。
+
+    @staticmethod
+    def _js_string(value: str) -> str:
+        """把名字转成可安全嵌进 JS 的字符串字面量。
+
+        `ensure_ascii=False` 是刻意的：默认会把中文转成 `\\uXXXX`，
+        JS 能正确还原（功能没问题），但日志里就成了一串转义码，
+        排查时看不出到底切了哪个表情。项目里构建 manifest 也是这么写的。
+        """
+        return json.dumps(str(value), ensure_ascii=False)
+
+    def play_motion(self, name: str) -> None:
+        """播一次指定动作（播完自己停）。"""
+        self._js(f"MeidoLive2D.playMotion({self._js_string(name)});")
+
+    def set_expression(self, name: str) -> None:
+        """切到指定表情。"""
+        self._js(f"MeidoLive2D.setExpression({self._js_string(name)});")
+
+    def clear_expression(self) -> None:
+        """清掉表情、回到模型默认脸。"""
+        self._js("MeidoLive2D.clearExpression();")
 
     def stop(self) -> None:
         if self._poll is not None:

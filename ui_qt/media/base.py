@@ -79,8 +79,13 @@ class MediaSource(ABC):
         self.apply_style(style)
 
     @abstractmethod
-    def set_state(self, state: AgentState) -> None:
-        """响应 Agent 状态；静态图可忽略。"""
+    def set_state(self, state: AgentState, skip_expression: bool = False) -> None:
+        """响应 Agent 状态；静态图可忽略。
+
+        `skip_expression` 只对 Live2D 层有意义（AI 显式设的表情正在保持期，
+        不该被状态机的映射覆盖）。基类收下这个参数只是为了统一签名 ——
+        否则调用方得按类型分支，很容易漏。
+        """
 
     def start(self) -> None:
         """开始播放（静态图忽略）。"""

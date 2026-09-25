@@ -321,11 +321,14 @@
     return true;
   };
 
-  /* Agent 状态 -> 动作/表情。映射表由 Python 侧注入，缺省什么都不做。 */
-  api.setState = function (state) {
+  /* Agent 状态 -> 动作/表情。映射表由 Python 侧注入，缺省什么都不做。
+     skipExpression=true 时只播动作、不动表情 —— AI 显式设的表情正在保持期，
+     不该被状态机覆盖。 */
+  api.setState = function (state, skipExpression) {
     var action = api.stateMap[state];
     if (!action) { return false; }
     if (action.motion) { api.playMotion(action.motion); }
+    if (skipExpression) { return true; }
     /* expression 是字符串就按它执行：
          非空 -> 切到这个表情；空串 -> 清掉表情回正常脸。
        键不存在则保持当前表情不动。 */
