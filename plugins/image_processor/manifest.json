@@ -1,0 +1,8 @@
+{
+    "name": "image_processor",
+    "version": "0.0.1",
+    "type": "tool",
+    "entry": "main.py",
+    "author": "ShiKi",
+    "description": "图像处理插件，扩展ComfyUI功能"
+}

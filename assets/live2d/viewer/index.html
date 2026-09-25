@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live2D Viewer</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: transparent; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+  }
+  #stage { position: absolute; inset: 0; }
+  #stage canvas { display: block; }
+  #error {
+    display: none; position: absolute; left: 0; top: 0; right: 0;
+    margin: 0; padding: 8px 10px; max-height: 100%; overflow: auto;
+    font: 12px/1.5 Consolas, monospace; white-space: pre-wrap;
+    color: #b3261e; background: rgba(255, 255, 255, .92);
+  }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<pre id="error"></pre>
+
+<script src="lib/live2dcubismcore.min.js"></script>
+<script src="lib/pixi.min.js"></script>
+<script src="lib/cubism4.min.js"></script>
+<script>
+/* 妹抖酱 Live2D 播放器
+ *
+ * 入参（URL query，均由 Python 侧拼装，页面内不硬编码任何模型路径）：
+ *   model    —— c_0120.model3.json 的相对 URL（相对本页面）
+ *   manifest —— base64url(UTF-8 JSON)，形如 {"motions":[...],"expressions":[...]}
+ *               条目是相对 model3.json 的路径
+ *
+ * 状态出口：window.MeidoLive2D，Python 侧用 runJavaScript 读 JSON.stringify() 轮询。
+ */
+(function () {
+  "use strict";
+
+  var api = {
+    ready: false,
+    error: null,
+    model: null,
+    motions: [],
+    expressions: [],
+    currentMotion: null,
+    currentExpression: null,
+    stateMap: {}
+  };
+  window.MeidoLive2D = api;
+
+  var app = null;
+  var model = null;
+  var zoom = 1.0;
+  /* 交互参数（由 Python 侧经 manifest 注入，见 config/live2d.toml） */
+  var focusGain = 0.35;          // 视线跟随系数：越小，头/眼转动越轻微
+  var focusRest = 1.2;           // 停止移动多少秒后回正（0 = 不回正）
+  var focusTimer = null;
+  var clickExpressions = [];     // 点击立绘时依次轮换的表情
+  var clickRevert = 2.0;         // 点击后多少秒恢复状态表情（0 = 不恢复）
+  var clickIndex = -1;
+  var stateExpression = "";      // 最近一次由对话状态驱动的表情
+  var clickTimer = null;
+  var stageEl = document.getElementById("stage");
+  var errorEl = document.getElementById("error");
+
+  function reportError(err) {
+    var msg = (err && err.stack) ? err.stack : String(err);
+    api.error = msg;
+    api.ready = false;
+    errorEl.style.display = "block";
+    errorEl.textContent = "Live2D 加载失败：\n" + msg;
+    document.title = "Live2D-ERROR";
+    console.error(msg);
+  }
+
+  function query(name) {
+    return new URLSearchParams(window.location.search).get(name);
+  }
+
+  function decodeManifest(raw) {
+    if (!raw) { return { motions: [], expressions: [], stateMap: {}, interaction: {} }; }
+    try {
+      var b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+      while (b64.length % 4) { b64 += "="; }
+      var bin = atob(b64);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) { bytes[i] = bin.charCodeAt(i); }
+      var obj = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+      return {
+        motions: obj.motions || [],
+        expressions: obj.expressions || [],
+        stateMap: obj.stateMap || {},
+        interaction: obj.interaction || {}
+      };
+    } catch (e) {
+      return { motions: [], expressions: [], stateMap: {}, interaction: {} };
+    }
+  }
+
+  /* motions/自拍.motion3.json -> 自拍 ；吐舌.exp3.json -> 吐舌 */
+  function stem(path) {
+    var name = String(path).split("/").pop();
+    return name.replace(/\.motion3\.json$/i, "").replace(/\.exp3\.json$/i, "");
+  }
+
+  function fit() {
+    if (!model || !app) { return; }
+    var w = app.renderer.width;
+    var h = app.renderer.height;
+    var im = model.internalModel;
+    if (!w || !h || !im || !im.originalWidth || !im.originalHeight) { return; }
+    var scale = Math.min(w / im.originalWidth, h / im.originalHeight) * zoom;
+    model.anchor.set(0.5, 1);
+    model.scale.set(scale);
+    model.x = w / 2;
+    model.y = h;
+  }
+
+  /* ── 对外控制接口（Python 侧 runJavaScript 调用） ── */
+
+  api.playMotion = function (group) {
+    if (!model || !group) { return false; }
+    try {
+      model.motion(group);
+      api.currentMotion = group;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  api.setExpression = function (name) {
+    if (!model) { return false; }
+    try {
+      model.expression(name);
+      api.currentExpression = name;
+      stateExpression = name || "";
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  /* 点击立绘：依次轮换一个表情，过一会儿再恢复成状态表情。
+     直接用 model.expression 而**不**走 api.setExpression —— 否则会把
+     状态表情覆盖掉，点击结束后就回不去了。 */
+  function poke() {
+    if (!model || !clickExpressions.length) { return; }
+    clickIndex = (clickIndex + 1) % clickExpressions.length;
+    var name = clickExpressions[clickIndex];
+    try {
+      model.expression(name);
+      api.currentExpression = name;
+    } catch (e) {
+      return;
+    }
+    if (clickTimer) { clearTimeout(clickTimer); }
+    if (clickRevert > 0) {
+      clickTimer = setTimeout(function () {
+        if (!stateExpression) { return; }
+        try {
+          model.expression(stateExpression);
+          api.currentExpression = stateExpression;
+        } catch (e) { /* 忽略 */ }
+      }, clickRevert * 1000);
+    }
+  }
+
+  api.setInteraction = function (opts) {
+    opts = opts || {};
+    if (Array.isArray(opts.clickExpressions)) {
+      clickExpressions = opts.clickExpressions.slice();
+    }
+    if (isFinite(Number(opts.clickRevertSeconds))) {
+      clickRevert = Math.max(0, Number(opts.clickRevertSeconds));
+    }
+    if (isFinite(Number(opts.focusGain))) {
+      focusGain = Math.max(0, Math.min(1, Number(opts.focusGain)));
+    }
+    if (isFinite(Number(opts.focusRestSeconds))) {
+      focusRest = Math.max(0, Number(opts.focusRestSeconds));
+    }
+    return true;
+  };
+
+  /* 视线跟随：直接写 focusController 的目标值。
+     **不能**用 model.focus() —— 它内部把坐标转成角度后只取单位向量
+     （`focus(Math.cos(a), -Math.sin(a))`），距离信息被丢掉，于是：
+       1) 靠缩放输入坐标来调灵敏度是无效的（角度没变）—— 表现就是"怎么调都那么灵敏"
+       2) targetX/targetY 永远落在单位圆上，模型永远"歪到底"，没有中立位，也就无法回正
+     改成「相对模型中心的偏移 × 增益」，增益才真正起作用，也才有回正可言。 */
+  function applyFocus(clientX, clientY) {
+    if (!model) { return; }
+    var im = model.internalModel;
+    var fc = im && im.focusController;
+    if (!fc) { return; }
+    var b = model.getBounds();
+    if (!b.width || !b.height) { return; }
+    var nx = (clientX - (b.x + b.width / 2)) / (b.width / 2) * focusGain;
+    var ny = (clientY - (b.y + b.height / 2)) / (b.height / 2) * focusGain;
+    fc.targetX = Math.max(-1, Math.min(1, nx));
+    fc.targetY = Math.max(-1, Math.min(1, ny));
+  }
+
+  /* 视线回正到初始的正前方（水平与垂直都归零） */
+  function resetFocus() {
+    if (!model) { return; }
+    var im = model.internalModel;
+    var fc = im && im.focusController;
+    if (!fc) { return; }
+    fc.targetX = 0;
+    fc.targetY = 0;
+  }
+
+  function scheduleFocusRest() {
+    if (focusTimer) { clearTimeout(focusTimer); }
+    if (focusRest <= 0) { return; }
+    focusTimer = setTimeout(resetFocus, focusRest * 1000);
+  }
+
+  /* 诊断出口：闭包内的变量（model / focusGain 等）外部读不到，
+     这里统一暴露出来，供 Python 侧自检与排查用。 */
+  api.debug = function () {
+    return JSON.stringify({
+      focusGain: focusGain,
+      focusRestSeconds: focusRest,
+      clickExpressions: clickExpressions,
+      clickRevertSeconds: clickRevert,
+      clickIndex: clickIndex,
+      stateExpression: stateExpression,
+      hasModel: !!model
+    });
+  };
+
+  api.modelBounds = function () {
+    if (!model) { return ""; }
+    try {
+      var b = model.getBounds();
+      return JSON.stringify({ x: b.x, y: b.y, w: b.width, h: b.height });
+    } catch (e) {
+      return "";
+    }
+  };
+
+  /* 当前朝向：既有 focusController 的目标值/当前值，也有核心模型参数值。
+     注意**别只看核心模型参数** —— 每帧末尾的 loadParameters() 会把参数恢复成
+     更新前的快照，读出来恒为 0，容易误判成"跟随没生效"。 */
+  api.focusParams = function () {
+    if (!model) { return ""; }
+    try {
+      var im = model.internalModel;
+      var cm = im.coreModel;
+      var out = {};
+      var fc = im.focusController;
+      if (fc) {
+        out.targetX = fc.targetX;
+        out.targetY = fc.targetY;
+        out.currentX = fc.x;
+        out.currentY = fc.y;
+      }
+      var ids = ["ParamAngleX", "ParamAngleY", "ParamEyeBallX", "ParamEyeBallY"];
+      for (var i = 0; i < ids.length; i++) {
+        try { out[ids[i]] = cm.getParameterValueById(ids[i]); }
+        catch (e) { out[ids[i]] = null; }
+      }
+      return JSON.stringify(out);
+    } catch (e) {
+      return "";
+    }
+  };
+
+  /* 模型实际拥有的参数 ID（不同模型命名不同，跟随失效时先看这个） */
+  api.paramIds = function () {
+    if (!model) { return "[]"; }
+    try {
+      var cm = model.internalModel.coreModel;
+      var inner = cm._model || cm;
+      var ids = (inner.parameters && inner.parameters.ids) || inner._parameterIds || [];
+      return JSON.stringify(Array.prototype.slice.call(ids));
+    } catch (e) {
+      return "[]";
+    }
+  };
+
+  /* 直接调一次 focus 并回报结果 —— 跟随不生效时用来定位是「调用报错」
+     还是「参数没被驱动」。 */
+  api.probeFocus = function (x, y) {
+    if (!model) { return "no model"; }
+    try {
+      model.focus(Number(x), Number(y), true);
+      return "ok";
+    } catch (e) {
+      return String(e && e.stack ? e.stack : e);
+    }
+  };
+
+  /* 手动触发一次点击反应（Python 侧或调试用） */
+  api.poke = function () { poke(); return true; };
+
+  /* 清掉当前表情，回到模型默认脸。
+     用于「输出结束后回到正常表情」—— 光靠 setExpression("") 是清不掉的。 */
+  api.clearExpression = function () {
+    if (!model) { return false; }
+    try {
+      var mm = model.internalModel && model.internalModel.motionManager;
+      var em = mm && mm.expressionManager;
+      if (em) {
+        if (typeof em.resetExpression === "function") {
+          em.resetExpression();
+        } else if (typeof em.stopAllExpressions === "function") {
+          em.stopAllExpressions();
+        }
+      }
+    } catch (e) { /* 忽略：不同版本 API 有差异，清不掉也不该崩 */ }
+    api.currentExpression = "";
+    stateExpression = "";
+    return true;
+  };
+
+  /* Agent 状态 -> 动作/表情。映射表由 Python 侧注入，缺省什么都不做。 */
+  api.setState = function (state) {
+    var action = api.stateMap[state];
+    if (!action) { return false; }
+    if (action.motion) { api.playMotion(action.motion); }
+    /* expression 是字符串就按它执行：
+         非空 -> 切到这个表情；空串 -> 清掉表情回正常脸。
+       键不存在则保持当前表情不动。 */
+    if (typeof action.expression === "string") {
+      if (action.expression) {
+        api.setExpression(action.expression);
+      } else {
+        api.clearExpression();
+      }
+    }
+    return true;
+  };
+
+  api.fit = fit;
+
+  /* ── 层样式（由 Python 侧的 LayerStyle 驱动） ──
+     Qt 的 QGraphicsBlurEffect / QGraphicsOpacityEffect 对 QWebEngineView 无效
+     （它是独立渲染表面），所以虚化与透明只能在页面里用 CSS 做。 */
+  api.setOpacity = function (value) {
+    var v = Number(value);
+    if (!isFinite(v)) { return false; }
+    stageEl.style.opacity = String(Math.max(0, Math.min(1, v)));
+    return true;
+  };
+
+  api.setBlur = function (px) {
+    var v = Number(px);
+    if (!isFinite(v)) { return false; }
+    stageEl.style.filter = v > 0.5 ? "blur(" + v + "px)" : "none";
+    return true;
+  };
+
+  api.setZoom = function (k) {
+    var v = Number(k);
+    if (!isFinite(v) || v <= 0) { return false; }
+    zoom = v;
+    fit();
+    return true;
+  };
+
+  api.setStateMap = function (map) {
+    api.stateMap = (map && typeof map === "object") ? map : {};
+    return true;
+  };
+
+  /* 渲染结果自检：返回当前帧的 PNG dataURL（供 Python 侧落盘核对成像） */
+  api.snapshot = function () {
+    if (!app) { return ""; }
+    try {
+      return app.renderer.extract.canvas(app.stage).toDataURL("image/png");
+    } catch (e) {
+      return "";
+    }
+  };
+
+  function boot() {
+    var modelUrl = query("model");
+    if (!modelUrl) { reportError("缺少 ?model= 参数"); return Promise.resolve(); }
+    var manifest = decodeManifest(query("manifest"));
+    api.stateMap = manifest.stateMap;
+    api.setInteraction(manifest.interaction);
+
+    return fetch(modelUrl).then(function (res) {
+      if (!res.ok) {
+        throw new Error("模型配置读取失败 HTTP " + res.status + "：" + modelUrl);
+      }
+      return res.json();
+    }).then(function (json) {
+      /* 原 model3.json 未声明 Motions / Expressions，这里按清单补进去。
+         settings.url 是相对路径解析基准，必须回填，否则 ModelSettings 会报错。 */
+      json.url = modelUrl;
+      var fr = json.FileReferences = json.FileReferences || {};
+
+      if (manifest.motions.length) {
+        var groups = {};
+        manifest.motions.forEach(function (file) {
+          var g = stem(file);
+          if (!groups[g]) { groups[g] = []; }
+          groups[g].push({ File: file });
+        });
+        fr.Motions = groups;
+        api.motions = Object.keys(groups);
+      }
+      if (manifest.expressions.length) {
+        fr.Expressions = manifest.expressions.map(function (file) {
+          return { Name: stem(file), File: file };
+        });
+        api.expressions = fr.Expressions.map(function (e) { return e.Name; });
+      }
+
+      app = new PIXI.Application({
+        backgroundAlpha: 0,
+        antialias: true,
+        autoStart: true,
+        resizeTo: stageEl
+      });
+      stageEl.appendChild(app.view);
+
+      return PIXI.live2d.Live2DModel.from(json, {
+        autoInteract: false,
+        motionPreload: "NONE"
+      });
+    }).then(function (m) {
+      model = m;
+      app.stage.addChild(model);
+      api.model = modelUrl;
+
+      fit();
+      window.addEventListener("resize", fit);
+
+      /* 视线跟随光标；停下来一段时间后自动回正，光标移出窗口也立刻回正。 */
+      window.addEventListener("mousemove", function (e) {
+        applyFocus(e.clientX, e.clientY);
+        scheduleFocusRest();
+      });
+
+      window.addEventListener("mouseleave", function () {
+        if (focusTimer) { clearTimeout(focusTimer); }
+        resetFocus();
+      });
+
+      /* 点击立绘 → 轮换表情（只有落在模型包围盒内才算，避免点空白也触发） */
+      window.addEventListener("click", function (e) {
+        if (!model || !clickExpressions.length) { return; }
+        try {
+          var b = model.getBounds();
+          if (e.clientX < b.x || e.clientX > b.x + b.width) { return; }
+          if (e.clientY < b.y || e.clientY > b.y + b.height) { return; }
+        } catch (_) { return; }
+        poke();
+      });
+
+      if (api.motions.indexOf("idle") >= 0) { api.playMotion("idle"); }
+
+      api.ready = true;
+      document.title = "Live2D-READY";
+    });
+  }
+
+  boot().catch(reportError);
+})();
+</script>
+</body>
+</html>

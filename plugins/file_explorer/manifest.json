@@ -1,0 +1,169 @@
+{
+    "name": "file_explorer",
+    "version": "1.1.0",
+    "type": "tool",
+    "entry": "main.py",
+    "author": "ShiKi",
+    "description": "安全地浏览与修改本地文件系统：列出目录、查看文件信息、预览文本、写入文件、精确片段替换、删除文件（默认关闭）",
+
+    "─── 路径白名单说明 ──────────────────────────────": "",
+    "# 相对路径以用户主目录 (Path.home()) 为参考点": "",
+    "# 例如 ./Desktop = C:/Users/<当前用户名>/Desktop": "",
+    "# ${PROJECT_DIR} = 妹抖酱项目目录（exe/源码根目录）": "",
+    "# 支持环境变量展开，如 ${MY_FOLDER}": "",
+    "# 也支持绝对路径，如 C:/MyData": "",
+    "# 读（ls/view/info）与写（write_file/edit_file/delete_file）共用这份白名单": "",
+
+    "config": {
+        "whitelist": [
+            "./Desktop",
+            "${PROJECT_DIR}"
+        ],
+
+        "─── 写入能力配置 ──────────────────────────────": "",
+        "write": {
+            "enabled": true,
+            "require_confirm": false,
+            "allow_delete": true,
+            "backup_dir": ".meido_backups",
+            "max_backups": 5,
+            "max_bytes": 524288,
+            "protected": [
+                "core/**",
+                "ui_qt/**",
+                "workspace/**",
+                "plugins/**",
+                "tests/**",
+                "build/**",
+                "main.py",
+                "memory.py"
+            ],
+            "verify_command": "python -m pytest tests -q",
+            "verify_timeout": 180
+        },
+
+        "─── 打开能力配置 ──────────────────────────────": "",
+        "# 1) 白名单与读/写共用 config.whitelist（不重复定义，改一处即全生效）": "",
+        "# 2) confirm_extensions 里的类型首次打开需确认；确认后写入信任记录，": "",
+        "#    之后指纹（大小+纳秒时间）不变就直接打开；变了再比 SHA256，": "",
+        "#    内容确实变了才算「大变动」，重新走确认": "",
+        "# 3) 信任记录默认 data/trusted_paths.json，超过 max_trust_records 条按最久未用淘汰": "",
+        "# 4) check_signature=true 时用 powershell 读数字签名（读不到会如实说明，不阻止打开）": "",
+        "open": {
+            "enabled": true,
+            "confirm_extensions": [
+                ".exe", ".bat", ".cmd", ".com", ".scr", ".pif", ".cpl",
+                ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta",
+                ".msi", ".msp", ".reg", ".jar",
+                ".lnk", ".url"
+            ],
+            "trust_file": "data/trusted_paths.json",
+            "max_trust_records": 200,
+            "check_signature": true,
+            "signature_timeout": 10
+        }
+    },
+
+    "─── 写入规则（重要） ──────────────────────────────": "",
+    "# 1) 任何写入都必须在白名单内，且 resolve() 后校验（防 ../ 穿越与软链接）": "",
+    "# 2) 覆盖已存在文件前一律先备份到 .meido_backups/（最多保留 max_backups 份）": "",
+    "# 3) 命中 protected 的目标=妹抖酱自身代码：写入后自动跑 verify_command，": "",
+    "#    失败则自动回滚到备份（先备份，测试不坏才落定）": "",
+    "# 4) require_confirm=true 时进入两段式：先给 diff 预览，需再次调用并带 confirm=true 才写入": "",
+    "# 5) 每次写入都记审计日志 data/audit/file_edits.jsonl": "",
+
+    "tools": [
+        {
+            "name": "ls",
+            "description": "列出目录中的文件和子目录。path 留空=默认目录。只返回目录项列表、不含文件正文；不能搜索内容（用 kb_search 或文件搜索）。瞬时返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目录路径，相对路径基于用户主目录"}
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "info",
+            "description": "查看文件元信息（大小、修改时间、行数、类型）。只返回元数据、不含文件内容（读内容用 view）。瞬时返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"}
+                },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "view",
+            "description": "读取文本文件内容。lines 可选：整数=前 N 行、'all'=完整、'100-200'=范围。文件过大会截断并注明，可用 lines 继续读。本地读取，秒级返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件的绝对或相对路径"},
+                    "lines": {
+                        "anyOf": [
+                            {"type": "integer", "minimum": 1, "description": "读取前 N 行"},
+                            {"type": "string", "description": "'all' 或范围字符串如 '100-200'"}
+                        ],
+                        "description": "行数控制：整数=前N行，'all'=完整读取，'start-end'=范围"
+                    }
+                },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "write_file",
+            "description": "写入（新建或整体覆盖）一个文本文件。会自动创建缺失的父目录、写前自动备份、返回 unified diff。仅用于文本文件，且路径必须在白名单内。改动妹抖酱自身代码时会自动跑测试校验，失败即回滚。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目标文件路径（绝对，或相对当前目录）"},
+                    "content": {"type": "string", "description": "文件完整内容"},
+                    "confirm": {"type": "boolean", "description": "两段式确认的第二步（仅 require_confirm=true 时需要）"}
+                },
+                "required": ["path", "content"]
+            }
+        },
+        {
+            "name": "edit_file",
+            "description": "按精确片段修改文本文件：把 old 替换成 new。old 必须在文件中唯一存在（除非 replace_all=true），否则会报错并告诉你出现了几次 —— 此时请先把 old 写长一点以唯一确定位置。写前自动备份、返回 unified diff。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "目标文件路径（绝对，或相对当前目录）"},
+                    "old": {"type": "string", "description": "要被替换的原文片段，必须原样匹配（含缩进与换行）"},
+                    "new": {"type": "string", "description": "替换后的新内容"},
+                    "replace_all": {"type": "boolean", "description": "是否替换全部匹配（默认 false，只替换第一处）"},
+                    "confirm": {"type": "boolean", "description": "两段式确认的第二步（仅 require_confirm=true 时需要）"}
+                },
+                "required": ["path", "old", "new"]
+            }
+        },
+        {
+            "name": "delete_file",
+            "description": "删除文件。删除前会自动备份到 .meido_backups/，路径必须在白名单内；不想要这个能力就在 manifest.json 关掉 config.write.allow_delete。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "要删除的文件路径"},
+                    "confirm": {"type": "boolean", "description": "两段式确认的第二步"}
+                },
+                "required": ["path"]
+            }
+        },
+        {
+            "name": "open_path",
+            "description": "用系统默认程序打开白名单内的文件或目录（桌面上的游戏快捷方式、文档、图片、文件夹等）。可执行类（.exe/.bat/.url/.lnk 等）首次打开会先返回来源审查报告，需再次调用并带 confirm=true；确认后写入信任记录，之后文件没变化就直接打开，内容变了才会再问一次。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "要打开的文件或目录路径"},
+                    "confirm": {"type": "boolean", "description": "可执行类首次打开的确认第二步；普通文件与目录不需要"}
+                },
+                "required": ["path"]
+            }
+        }
+    ]
+}

@@ -1,0 +1,47 @@
+# WhaleGirl V2 · 依赖清单
+#
+# 安装：
+#   python -m pip install -r requirements.txt
+#
+# 环境：本机实测 Python 3.14.6 / Windows
+#   - 代码用标准库 tomllib 读 TOML（Python 3.11+）；3.10 需额外装 tomli（见文末）
+#   - 所有版本号均为**本机实测可用版本**（== 固定），换机复现请勿随意升级
+
+# ─────────── 核心（必须） ───────────
+openai==2.44.0              # LLM 调用（DeepSeek / OpenAI 兼容接口）
+PySide6==6.11.2             # 桌面 UI（Qt 6，M1 起替代 Gradio；本机 Python 3.14.6 实测可用）
+chromadb==1.5.9             # 向量库：知识库 RAG + 历史向量检索
+requests==2.34.2            # HTTP
+numpy==2.5.0                # 向量计算
+PyYAML==6.0.3               # YAML 配置读写
+tomli_w==1.2.0              # 工作空间 TOML 写入（缺失会退化为内置序列化器）
+
+# ─────────── 插件：web_search ───────────
+ddgs==9.16.0                # DuckDuckGo 搜索（duckduckgo-search 的更名后继包，推荐装这个）
+# duckduckgo-search==8.1.1  # 旧包名，兼容保留（已装 ddgs 时不会用到；旧包会打弃用告警）
+beautifulsoup4==4.15.0      # HTML 解析
+lxml==6.1.1                 # BeautifulSoup 解析器
+readability-lxml==0.8.4.1   # 正文自动提取
+markdownify==1.2.3          # HTML → Markdown
+
+# ─────────── 插件：knowledge_base ───────────
+rank-bm25==0.2.2            # BM25 关键词检索（混合检索的一半）
+jieba==0.42.1               # 中文分词（BM25 前置）
+PyPDF2==3.0.1               # PDF 解析
+python-docx==1.2.0          # Word 解析
+pillow==12.3.0              # 图片处理
+pytesseract==0.3.13         # OCR（另需自行安装 Tesseract-OCR 可执行文件）
+
+# ─────────── 开发 / 测试 ───────────
+pytest==9.1.1               # python -m pytest tests -v
+pyinstaller==6.22.2         # 打包 exe（M2；python -m PyInstaller build/meido.spec --noconfirm）
+
+# ─────────── 可选（默认不装，需要对应能力时再装） ───────────
+# fastmcp                   # 仅 plugins/knowledge_base/mcp_server.py 需要（把知识库以 MCP 协议对外暴露）
+# tomli                     # 仅 Python 3.10 需要：tomli==2.0.1; python_version < "3.11"
+# sentence-transformers     # 仅本地 embedding 备用方案；当前默认走 Ollama 的 bge-m3
+
+# ─────────── 非 pip 依赖（自行安装） ───────────
+# Ollama          ：本地模型推理（bge-m3 向量模型、对话模型）
+# Tesseract-OCR   ：图片文字识别（pytesseract 的底层程序）
+# Clash/其他代理  ：DuckDuckGo 与远程 SearXNG 需要（见 plugins/web_search/config.yaml 的 proxy 段）

@@ -1,0 +1,48 @@
+# ── 模型服务商配置 ──
+# 本文件由「设置 → 模型」界面写入，也可手工编辑（重启后生效）。
+#
+#   [model]         当前生效的配置（provider / base_url / 默认模型…）
+#   [[model.sites]] 已保存的站点与模型列表，界面里可增删改、可设为当前
+#
+# api_key 支持 ${ENV_VAR} 引用：真值写在 config/apikey.local（已被 .gitignore 忽略），
+# 本地服务商（ollama / lmstudio）的占位 key 可直接明文放在这里。
+[model]
+provider = "deepseek"
+api_key = "${MEIDO__KEY}"
+base_url = "https://api.deepseek.com"
+active_site = "官方"
+
+[model.defaults]
+model = "deepseek-flash"
+thinking = true
+reasoning_effort = "high"
+max_tokens = 8192
+
+[model.aliases]
+flash = "deepseek-v4-flash"
+pro = "deepseek-v4-pro"
+chat = "deepseek-v4-flash"
+
+[model.retry]
+max_retries = 1
+retry_delay_seconds = 1
+
+[[model.sites]]
+name = "本地 Ollama"
+provider = "ollama"
+base_url = "http://localhost:11434/v1"
+api_key = "ollama"
+model = "qwen3.5:27b"
+thinking = true
+reasoning_effort = "low"
+max_tokens = 8192
+
+[[model.sites]]
+name = "官方"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key = "${MEIDO__KEY}"
+model = "deepseek-flash"
+thinking = true
+reasoning_effort = "high"
+max_tokens = 8192

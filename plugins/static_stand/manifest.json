@@ -1,0 +1,8 @@
+{
+    "name": "static_stand",
+    "version": "0.1.0",
+    "type": "stand",
+    "entry": "main.py",
+    "author": "ShiKi",
+    "description": "一个简单的静态立绘占位插件，为未来Live2D做准备"
+}

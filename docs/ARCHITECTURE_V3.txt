@@ -1,0 +1,708 @@
+# 妹抖酱 v0.1 · 架构与实施指导书（ARCHITECTURE_V3）
+
+> 状态：**已定稿，为唯一权威技术路线**
+> 定位：本项目从「Gradio Web 版」升级为「原生桌面 exe」，并为后续 MCP / SQL / 动效 / Live2D 预留扩展点。
+> 读者：负责执行的 AI 会话 / 开发者。**本文档自包含，不依赖任何对话历史。**
+
+---
+
+## 0. 这份文档怎么用（执行方必读）
+
+1. 本文档是**唯一权威**。若与其他文档（`ARCHITECTURE.md` / `UPGRADE_PLAN.txt`）冲突，**以本文档为准**。
+2. 严格按 **M1 → M7 顺序**执行。**每个里程碑必须先通过其「验收清单」才能进入下一个**，禁止跳步、禁止提前动后面阶段的东西。
+3. **每完成一个里程碑，用第 10 节的固定格式回报**，并停下来等确认。
+4. 本文档**未覆盖**的技术决策：停下来记录问题并上报，**不要自行发明**。
+5. 铁律：**不回归**（现有能用的功能不许弄坏，见 §8）、**小步可验证**、**不臆造**（不确定标注「待确认」）。
+
+---
+
+## 1. 项目定位与命名
+
+| 项 | 值 | 说明 |
+|----|----|------|
+| 产品显示名 | **妹抖酱** | 标题栏、托盘 tooltip、About、README |
+| 版本 | **v0.1**（内部 `0.1.0`） | 新增常量 `APP_VERSION = "0.1.0"`，About 弹窗展示 |
+| 交付物 | `妹抖酱v0.1.exe` | 见 §7 打包规范 |
+| 代码目录 | **`meidochanv0.1`**（2026-09-12 用户决策：从 `WhaleGirl_v2/` 独立出来） | 原计划 M1 不动目录；后经用户明确要求整体搬家。**包名（`core` / `ui_qt` / `workspace` 等）未变**，因为 §4.2 路径层已全量替换，搬家只依赖 `APP_DIR`，无需改 import。遗留旧文件（`brainB/`、`WhaleGirl_v2 lib/`、`ai_brain.py`、`_fix_emoji.py`、`ARCHITECTURE.md`、`API/`）留在原处待清理 |
+| 同步改名位置 | 标题栏、托盘、About、`README.txt`、`config/bot.toml` 的 `name`、日志文件名前缀 | |
+| 配置文件 | `config/app.toml` 新增 `[app] name/version` | 或直接用常量，二选一，**不要两处都写** |
+
+> 中文 exe 名的注意事项见 §7.6。
+
+### 1.1 项目边界（重要 · 2026-09-12 用户决策收敛）
+
+| 项目 | 职责 | 状态 |
+|------|------|------|
+| **meidochanv0.1（妹抖酱）** | **纯桌面 Agent**（PySide6），只服务本机桌面场景 | 本项目 |
+| **WhaleGirlQQ** | QQ 群机器人 | **独立项目**，与本项目**不共享代码** |
+
+**决策：妹抖酱不再包含任何 QQ 内容。** QQ 能力由独立项目承担。
+
+因此本项目必须**移除 `qq/` 及其全部引用**（见 §6-M1b），且**后续任何里程碑都不得重新引入平台适配器**（MCP / SQL / 动效不受此影响）。
+
+> 背景说明：本项目曾内置的 `qq/`（复用 meido 引擎 + OneBot v11）与 `WhaleGirlQQ`（自带 `whalegirl` 独立包）是**两套不同实现**。收敛后，QQ 以 `WhaleGirlQQ` 为唯一项目。
+
+---
+
+## 2. 已锁定技术栈（决策表 · 不得擅自更改）
+
+| 层 | 选型 | 备注 |
+|----|------|------|
+| 平台范围 | **仅桌面（PySide6）** | ❌ **不含 QQ / 其它平台适配器**；QQ 见独立项目 `WhaleGirlQQ`（§1.1） |
+| 桌面 UI | **PySide6（Qt 6）** | 原生窗口，LGPL，官方 PyInstaller hook |
+| UI 样式 | **自绘 QSS + 设计令牌** | ❌ 不用 PySide6-Fluent-Widgets（可控性优先） |
+| 打包 | **PyInstaller `--onedir`** | ❌ 不用 `--onefile`（启动慢、杀软误报高） |
+| 图片素材 | `QPixmap` / `QGraphicsView` | 静态 png/jpg/webp |
+| 动效 | **仅预留接口**（`MediaSource`） | 暂不选型，不引入任何动效依赖 |
+| 立绘 | **静态图占位**（现 `plugins/static_stand/stand.png`） | 升级为 `MediaSource` 的一个实现 |
+| Live2D | **仅预留** | 暂不引入 `live2d-py` |
+| 视频 | **不做** | ❌ 不引入 `QtMultimedia` / FFmpeg |
+| Embedding | **Ollama `/api/embed`（`bge-m3`）** | 保持现状，进程内**无 torch** |
+| LLM | Ollama / DeepSeek（OpenAI SDK） | 保持现状 |
+| 向量库 | 阶段一 ChromaDB；**M7 评估换轻量实现** | 见 §6-M7 |
+| 存储 | 静态配置留在 TOML；**数据层 M6 迁移到 SQLite** | 先抽象 Repository（M4） |
+| 工具扩展 | **M4 统一 `ToolRegistry`**；M5 接 MCP | 见 §4.3 / §4.6 |
+| 并发 | 引擎在后台线程，UI 用 **`QThread` + Signal** | 引擎原有线程模型不动 |
+| 日志 | `logging` + `RotatingFileHandler` | 无控制台时排障依赖它 |
+| 路径 | **新增 `core/paths.py`**（`APP_DIR` / `RESOURCE_DIR`） | **M2 必做前置** |
+| 测试 | `pytest`（已有 `tests/` + `pytest.ini`） | 每个阶段都要跑 |
+
+### 2.1 明确「不引入」清单（避免体积/稳定性倒退）
+
+`QtWebEngine`、`QtMultimedia`(FFmpeg)、`qt-lottie`、`live2d-py`、`PySide6-Fluent-Widgets`、`torch`、`sentence-transformers`、`Gradio`（本次移除）。
+
+依赖策略：虚拟环境安装、**固定版本**（`requirements.txt` 写死 `==`）、新增依赖必须先说明理由与体积代价。
+
+---
+
+## 3. 目标态架构
+
+### 3.1 分层
+
+```
+[UI 层]      PySide6 桌面（唯一形态）
+                    ↓ Engine API + 事件总线（同一套，不重复实现）
+[编排层]      Engine / Orchestrator ── ContextEngine / History / MessageBus(本次接线)
+                    ↓
+[能力层]      ToolRegistry  ★（M4 统一）
+              ├ BuiltinProvider   内置（model/think/memory/history…）
+              ├ PluginProvider    plugins/ 动态加载
+              ├ MCPProvider   ★M5 外部 MCP Server 工具
+              └ DataProvider  ★M6 SQL / 数据查询工具
+                    ↓
+[领域服务层]  Memory / Knowledge / Conversation / Member / Audit
+                    ↓
+[存储层]      Repository 协议 ★M4 ── JsonRepository(现状) / SqlRepository(M6)
+              Workspace │ Conversation │ Memory │ Member │ Audit │ VectorStore
+                    ↓
+[基础设施]    config / logging / paths / sandbox / http / 进程管理
+```
+
+### 3.2 目标目录结构（新增/变更部分）
+
+```
+meidochanv0.1/                  # 2026-09-12 从 WhaleGirl_v2/ 独立（见 §1）
+├── main.py                     # 改为启动 PySide6（不再 launch Gradio）
+├── core/
+│   ├── paths.py                # ★新增：APP_DIR / RESOURCE_DIR
+│   ├── message_bus.py          # ★接线（现为死代码）
+│   ├── tools/                  # ★新增：ToolRegistry / ToolProvider / Tool 模型
+│   └── storage/                # ★新增：Repository 协议 + 后端实现
+├── ui_qt/                      # ★新增：PySide6 界面
+│   ├── app.py                  # 应用装配 + 主循环
+│   ├── main_window.py          # 无边框主窗口 / 标题栏 / 布局
+│   ├── chat_view.py            # 聊天区（气泡 + Markdown + 思考折叠）
+│   ├── sidebar.py              # 工作空间 / 会话 / 角色
+│   ├── stage_view.py           # 素材舞台（三层合成）
+│   ├── settings_dialog.py      # 设置（模型 / 外观 / 日志）
+│   ├── theme.py                # 设计令牌 + QSS 生成
+│   └── media/                  # ★媒体抽象层（本阶段只实现 IMAGE）
+│       ├── base.py             # MediaKind/AgentState/LayerStyle/AssetSpec/MediaSource/MediaRegistry
+│       └── sources/            # image_source.py（唯一实现）
+├── assets/                     # ★素材根目录（外置，迁移友好）
+│   ├── theme.toml              # 主题包描述
+│   └── default/                # 默认主题（背景 / 立绘占位）
+├── ui/                         # ⚠️ 旧 Gradio 界面：M1 完成后删除（含 _test_render.py）
+├── qq/                         # ❌ M1b 删除：QQ 已拆分为独立项目 WhaleGirlQQ（§1.1）
+├── adapters/                   # ❌ M1b 删除：仅空 __init__.py、无任何引用
+├── 启动妹抖酱QQ.bat             # ❌ M1b 删除
+├── config/adapters.toml        # ❌ M1b 删除：无代码引用 + 含明文 token（见 §8-4）
+├── docs/
+│   ├── ARCHITECTURE_V3.txt      # 本文档
+│   └── TEST_CHECKLIST.txt       # 人工验收清单
+└── build/                      # ★打包产物与 spec（M2）
+    ├── meido.spec
+    └── build.bat
+```
+
+---
+
+## 4. 关键接口契约（执行方必须按此实现）
+
+> 这些接口是「预留扩展」的落地方式：**将来加 MCP / SQL / 动效 / Live2D，只新增实现类，不改调用方**。
+
+### 4.1 媒体层（M1 定义，仅实现 IMAGE）
+
+```python
+# ui_qt/media/base.py
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Callable
+
+class MediaKind(str, Enum):
+    IMAGE      = "image"     # ✅ M1 实现（png/jpg/webp 静态）
+    ANIM_IMAGE = "anim"      # ⏳ 预留（gif / 动图 webp）
+    LOTTIE     = "lottie"    # ⏳ 预留
+    LIVE2D     = "live2d"    # ⏳ 预留
+    PROCEDURAL = "proc"      # ⏳ 预留（粒子 / 代码特效）
+
+class AgentState(str, Enum):
+    IDLE = "idle"; THINKING = "thinking"; WORKING = "working"
+    RESPONDING = "responding"; ERROR = "error"; SURPRISE = "surprise"
+
+@dataclass
+class LayerStyle:
+    """虚化 / 透明 / 布局统一描述，与媒体类型无关。"""
+    visible: bool = True
+    opacity: float = 1.0          # 0..1，层透明
+    blur_radius: float = 0.0      # >=0，层虚化（景深）
+    scale: float = 1.0
+    anchor: str = "bottom-center"
+    offset: tuple[int, int] = (0, 0)
+    z: int = 0
+
+@dataclass
+class AssetSpec:
+    id: str
+    kind: MediaKind
+    path: Path
+    style: LayerStyle = field(default_factory=LayerStyle)
+    params: dict = field(default_factory=dict)   # 各类型私有参数
+
+class MediaSource(ABC):
+    kind: MediaKind
+    @abstractmethod
+    def attach(self, host) -> None: ...
+    @abstractmethod
+    def detach(self) -> None: ...
+    @abstractmethod
+    def apply_style(self, style: LayerStyle) -> None: ...
+    @abstractmethod
+    def set_state(self, state: AgentState) -> None: ...   # 静态图可忽略
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+
+class MediaRegistry:
+    """kind -> factory。新增动效类型 = register 一个新的工厂。"""
+    def register(self, kind: MediaKind, factory: Callable[[AssetSpec], MediaSource]) -> None: ...
+    def create(self, spec: AssetSpec) -> MediaSource: ...
+```
+
+**舞台（三层合成）**：
+
+```python
+# ui_qt/stage_view.py
+class StageView(QWidget):
+    """backdrop(背景) / stand(立绘) / overlay(特效) 三层，统一管理 LayerStyle。"""
+    def set_layer(self, slot: str, source: "MediaSource | None") -> None: ...
+    def set_style(self, slot: str, style: LayerStyle) -> None: ...
+    def on_agent_state(self, state: AgentState) -> None:
+        for src in self._layers.values():
+            if src:
+                src.set_state(state)
+```
+
+**立绘插件（升级现有 `plugins/static_stand`）**：
+
+```python
+class StandPlugin(BasePlugin):          # manifest type = "stand"
+    def get_sources(self) -> list[AssetSpec]: ...
+# M1：StaticStandPlugin -> [AssetSpec(kind=IMAGE, path="stand.png")]
+# 将来：LottieStandPlugin -> [AssetSpec(kind=LOTTIE, ...)]，UI 与引擎零改动
+```
+
+**约束**：
+- M1 **只实现** `MediaKind.IMAGE`；其余 kind 在 `MediaRegistry` 中**不注册**（或注册为抛 `NotImplementedError` 的占位）。
+- 虚化/透明**必须**通过 `LayerStyle` 走 `apply_style()`，**禁止**在具体 Source 里写死效果参数。
+
+### 4.2 路径层（M2 前置，全项目替换相对路径）
+
+```python
+# core/paths.py
+import sys
+from pathlib import Path
+
+IS_FROZEN = getattr(sys, "frozen", False)
+
+# 用户数据 / 配置 / 插件 / 素材：始终在 exe（或项目根）旁边 → 可迁移、可编辑
+APP_DIR: Path = (Path(sys.executable).parent if IS_FROZEN
+                 else Path(__file__).resolve().parent.parent)
+
+# 只读资源（打包进 exe 的静态资源）
+RESOURCE_DIR: Path = Path(getattr(sys, "_MEIPASS", APP_DIR))
+
+def app_path(*parts: str) -> Path:      return APP_DIR.joinpath(*parts)
+def resource_path(*parts: str) -> Path: return RESOURCE_DIR.joinpath(*parts)
+```
+
+**规则**：
+- `config/`、`workspaces/`、`plugins/`、`assets/`、`data/` → **一律走 `app_path()`**。
+- 打包内的只读资源 → `resource_path()`。
+- 全项目 `Path("config")`、`Path("workspaces")` 这类相对路径**必须全部替换**（`ui/chat_page.py` 里已有 `Path("workspaces/.initialized")` 等，属高危）。
+
+### 4.3 工具层（M4 统一，MCP 前置）
+
+现状问题：工具机制有**三套平行实现**——`core/brain.py` 的 `BUILTIN_TOOLS`、插件 `manifest.json#tools[]`（声明）、插件 `register_commands()`（执行），执行侧靠 `plugins/manager.py::execute_tool` 里一串 `if cmd == "/xxx"` 硬拼字符串。**必须先统一**，否则 MCP/SQL 会污染 `brain.py`。
+
+```python
+# core/tools/base.py
+class RiskLevel(str, Enum):
+    READ = "read"; WRITE = "write"; DESTRUCTIVE = "destructive"
+
+@dataclass
+class Tool:
+    name: str                       # 全局唯一，见命名空间规则
+    description: str
+    parameters: dict                # JSON Schema
+    handler: Callable[[dict], str]
+    source: str                     # "builtin" | "plugin:<name>" | "mcp:<server>" | "sql"
+    risk: RiskLevel = RiskLevel.READ
+    require_approval: bool = False  # ★复活死字段
+
+class ToolProvider(ABC):
+    def list_tools(self) -> list[Tool]: ...
+    def call(self, name: str, arguments: dict) -> str: ...
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+    def health(self) -> dict: ...
+
+class ToolRegistry:
+    def register_provider(self, provider: ToolProvider) -> None: ...
+    def openai_tools(self) -> list[dict]: ...       # 给 brain 的 tools 参数
+    def execute(self, name: str, arguments: dict) -> str: ...  # 统一路由
+```
+
+**命名空间规则**：内置 `model`；插件 `kb_search`；MCP `mcp__<server>__<tool>`；数据 `sql__query`。
+**风险与审批**：`risk != READ` 或 `require_approval=True` 时，`execute()` 前必须走 `MessageBus.TOOL_BEFORE_EXECUTE`，由 UI 弹确认；拒绝则返回可读说明，不抛异常。
+
+### 4.4 存储层（M4 定义协议，M6 接 SQL）
+
+现状 `workspace/storage.py` 已是手写 Repository（TOML 后端），把它**抽成协议**并补全：
+
+```python
+# core/storage/repository.py
+class WorkspaceRepository(Protocol):
+    def save(self, obj) -> None: ...
+    def load(self, key: str): ...
+    def list_all(self) -> list: ...
+    def delete(self, key: str) -> bool: ...
+# 同理：ConversationRepository / MemoryRepository / MemberRepository / AuditRepository
+```
+
+**规则**：业务代码**只依赖协议**，不得直接 `open()` 数据文件；后端由 `core/storage/factory.py` 按配置选择 `JsonRepository` / `SqlRepository`。
+
+### 4.5 事件总线（M4 接线；现为**死代码**）
+
+`core/message_bus.py` 已定义 `EventType` 但**全项目从未实例化**。M4 必须接线：
+
+| 事件 | 发布方 | 订阅方 | 用途 |
+|------|--------|--------|------|
+| `TOOL_BEFORE_EXECUTE` | ToolRegistry | UI / 审批器 | 风险拦截、弹窗审批 |
+| `TOOL_AFTER_EXECUTE` | ToolRegistry | AuditRepository | 审计落库 |
+| `CONFIG_CHANGED` | 设置面板 | Engine | 运行时热更新 |
+| `MESSAGE_RECEIVED` / `MESSAGE_SEND` | Engine | UI | 界面更新 |
+| `AGENT_THINKING/WORKING/RESPONDING/ERROR/IDLE` | Brain/Engine | StageView | ★驱动立绘动效（预留） |
+
+`MessageBus` 由 `Engine` 持有并注入各组件（单一实例）。
+
+### 4.6 MCP 接入（M5）
+
+**定位**：妹抖酱作为 **MCP Host/Client**（连外部 Server）；现有 `plugins/knowledge_base/mcp_server.py`（FastMCP 服务端）**保留**，两者不冲突。
+
+- 传输：`stdio`（主力）、`Streamable HTTP` / `SSE`（远程）。
+- SDK：官方 `mcp` Python SDK。⚠️ **它是 asyncio，而引擎是同步线程模型** → 必须封装「后台事件循环线程 + `asyncio.run_coroutine_threadsafe`」桥，桥接层**单独成模块并加测试**（这是最容易出 bug 的地方）。
+- 配置（外置，用户可增删）：`config/mcp.toml`
+
+```toml
+[[servers]]
+name      = "filesystem"
+transport = "stdio"          # stdio | http | sse
+command   = "npx"
+args      = ["-y", "@modelcontextprotocol/server-filesystem", "./data"]
+enabled   = true
+
+[servers.tools.write_file]   # 按工具覆盖风险策略
+risk             = "write"
+require_approval = true
+```
+
+- 生命周期：`McpManager` 负责 拉起子进程 → initialize 握手 → `list_tools` → 健康检查 → 崩溃重启 → **退出时清进程树**（Windows）。
+- 注册：发现的工具 → `McpProvider` → 注入 `ToolRegistry`，命名 `mcp__<server>__<tool>`。
+- 安全：默认白名单启用；写/删类默认需审批；限制 server 工作目录；超时 + 输出截断。
+- **打包影响**：MCP server 多是 node/python 进程（`npx`/`uvx`），**exe 打不进去**。首启必须检测 `node`/`npx`/`uv`/`uvx` 是否存在，缺失给人话指引；自家 server 优先用**内置 Python 实现**（用打包好的解释器起）。
+
+### 4.7 SQL 接入（M6）
+
+- 引擎：**默认 SQLite**（单文件、零运维、最好迁移）；接口留 Postgres/MySQL 口子。
+- 访问层：SQLAlchemy 2.x + Alembic（若体积敏感可退化为 `sqlite3` + 自管 `schema_version`）。
+- 进 SQL 的数据：会话消息、会话摘要、长期记忆、概览卡、群成员、**工具审计日志**、索引元数据。
+- 留 TOML 的数据：配置、人设、角色、pins（静态、人要读改）。
+- 表草案：
+
+```
+conversations(id, workspace_id, session_id, role, content, created_at, meta_json)
+sessions(id, workspace_id, title, summary, created_at, updated_at)
+memories(id, workspace_id, kind, key, value, updated_at)
+members(platform, user_id, display_name, aliases_json, last_seen)   -- 预留：纯桌面无此需求，供未来适配器
+tool_audit(id, workspace_id, tool, args_json, result_ref, risk, approved, created_at)
+vectors(id, workspace_id, kind, ref_id, embedding_blob, meta_json)   -- 若弃用 Chroma
+schema_version(version, applied_at)
+```
+
+- 并发：SQLite 开 **WAL**；写操作单写者；多线程写入（引擎后台线程 / UI 线程）必须串行化。
+- 迁移：启动检测 `schema_version` → 自动迁移；JSON 全量导入；**保留双写开关灰度**；**迁移前必须备份**。
+
+---
+
+## 5. UI 设计规范（自绘 QSS）
+
+### 5.1 设计令牌（统一走 `ui_qt/theme.py`，禁止散落硬编码颜色）
+
+**令牌的唯一出处是 `ui_qt/theme.py`**，本节不再抄具体色值 —— 之前这里复制了一份，
+结果 `accent` 从 `#1A73E8` 换到 `#3E63DD` 之后文档就成了错的。
+
+一个「主题」= 一组同名的 TOKENS 字典（当前 18 个语义色，分 5 组）：
+
+| 分组 | 令牌 |
+|------|------|
+| 底色与层次 | `bg` `surface` `sidebar-bg` `surface-hover` `code-bg` `border` |
+| 文字 | `text` `muted` `disabled` `on-solid` |
+| 主色 | `accent` `accent-hover` `accent-soft` `accent-text` |
+| 危险色 | `danger` `danger-soft` `danger-text` |
+| 滚动条 | `scrollbar` |
+
+- **预设**：`THEMES` = 亮色 / 深色 / 初音；另有 `CUSTOM_THEME_NAME`（自定义）
+- **取色**：一律走 `theme.active_tokens()`。`build_qss()` 与自绘控件
+  （`speech_bubble`）都从它取，所以 `set_active_theme()` 之后重新
+  `build_qss()` 即可全局换肤
+- **自绘控件必须手动重绘**：`speech_bubble` 是 `paintEvent` 里 `fillPath` 画的，
+  `setStyleSheet` 刷不掉它，得 `update()`（见 `MainWindow.apply_theme`）
+- **对比度**：`contrast_report()` 做 7 项 WCAG AA 检查；色轮面板据此提示用户
+  （只提示不阻止 —— 用户选了完全自由，但得知道代价）
+- **配置**：`config/appearance.toml`。预设名只存名字（预设改进能自动跟上），
+  自定义才写 18 个色值
+- 圆角 `8/12/14/16`、间距 `4/8/12/16`、字体
+  `"Microsoft YaHei UI", "Segoe UI", "Noto Sans SC"` —— Qt **不认** CSS 的
+  `system-ui`，实测会被模糊匹配成 Tahoma（为小字号屏幕优化的老字体，高 DPI 下发糙）
+
+### 5.2 窗口结构
+
+```
+┌─────────────────────────────────────────────────────┐
+│ [无边框标题栏] 妹抖酱 v0.1      ⚙  📌  ─  ▢  ✕      │ ← 可拖拽 / 圆角 / 置顶
+├──────────┬──────────────────────────┬───────────────┤
+│ 导航侧栏  │        聊天区             │  素材舞台      │
+│ · 工作空间│  气泡 + Markdown          │  backdrop     │
+│ · 会话列表│  + 思考折叠块             │  stand        │
+│ · 角色    │                          │  ─────────    │
+│ (可折叠)  │  ─────────────────────   │  虚化滑杆      │
+│          │  [输入框][附件][发送][停] │  透明滑杆      │
+├──────────┴──────────────────────────┴───────────────┤
+│ 状态栏：模型 · 连接状态(Ollama/MCP) · 版本            │
+└─────────────────────────────────────────────────────┘
+```
+
+### 5.3 工具栏分区
+
+| 区域 | 内容 |
+|------|------|
+| 顶栏左 | 品牌 + 工作空间下拉 |
+| 顶栏中 | 模型选择（云端 / 本地，实时探测） |
+| 顶栏右 | 外观（虚化·透明预设）、设置、置顶、最小/最大/关闭 |
+| 右侧舞台条 | 素材选择、动效开关（M1 置灰预留）、虚化滑杆、透明滑杆、层显隐 |
+| 输入区 | 输入框、附件（图片/文件）、发送、停止 |
+
+### 5.4 交互细节（必须实现）
+
+- 无边框拖拽；双击标题栏最大化；边缘可缩放；窗口位置/大小记忆。
+- 快捷键：`Ctrl+Enter` 发送、`Esc` 停止生成、`Ctrl+,` 设置。
+- 托盘常驻 + 最小化到托盘。
+- 生成中：输入区禁用、显示「停止」；流式文本逐字刷新。
+- 高 DPI 适配（`Qt.HighDpiScaleFactorRoundingPolicy`）。
+- 拖拽素材进舞台 → 识别类型 → 注册（M1.5）。
+
+### 5.5 虚化 / 透明（用户可调 · 三个层级独立）
+
+| 层级 | 技术 | 可调 |
+|------|------|:---:|
+| 窗口整体不透明度 | `setWindowOpacity()` | ✅ 滑杆 0.80–1.00 |
+| 窗口背景毛玻璃 | Win32 `SetWindowCompositionAttribute`（Acrylic） | ❌ 系统固定半径（开关） |
+| 层内虚化（景深） | `QGraphicsBlurEffect(radius)` 作用于**缓存 pixmap** | ✅ 滑杆 0–20 |
+
+**性能红线（必须遵守）**：`QGraphicsBlurEffect` **只作用于已缓存的静态图层**；拖动滑杆时用「降采样→模糊→升采样」，**松手后**才精算；禁止对每帧实时全分辨率模糊（4K 背景会卡）。
+
+**外观预设**：
+
+| 预设 | windowOpacity | 背景虚化 | Acrylic | 立绘景深 |
+|------|:---:|:---:|:---:|:---:|
+| 清晰 | 1.00 | 0 | 关 | 0 |
+| 标准 | 0.98 | 8 | 关 | 0 |
+| 沉浸 | 0.92 | 16 | 开 | 2 |
+
+### 5.6 状态联动（预留动效的挂载点）
+
+引擎发布 `AGENT_*` 事件 → `StageView.on_agent_state()` → 分发给所有 `MediaSource.set_state()`。**M1 静态图忽略即可**，但链路必须打通。
+
+---
+
+## 6. 分阶段实施计划（M1–M7）
+
+> 每阶段格式统一：**目标 / 前置 / 改动点 / 交付物 / 验收清单 / 禁止事项**。
+
+### M1 — 桌面窗口能跑（替换 Gradio）
+
+- **目标**：用 PySide6 重写界面，功能与现有 Gradio 版等价，`python main.py` 直接开窗。
+- **前置**：无。
+- **改动点**：
+  1. 新增 `ui_qt/`（§3.2 结构）与 `ui_qt/media/base.py`（§4.1 全部接口）。
+  2. `main.py` 改为启动 PySide6（保留引擎装配逻辑）。
+  3. 聊天区/侧栏/设置/舞台按 §5 实现；立绘走 `MediaSource(IMAGE)`。
+  4. 引擎在后台线程跑，`engine.respond()` 生成器 → `QThread`/Signal 流式推到 UI。
+  5. 删除旧 `ui/` 与 `_test_render.py`（**确认新界面可用后再删**）。
+- **交付物**：可运行的桌面应用；`ui_qt/` 全套；媒体层接口。
+- **验收清单**：
+  - [ ] `python main.py` 打开无边框窗口，无 traceback；
+  - [ ] 工作空间 创建 / 切换 / 删除 正常，切换后数据不串；
+  - [ ] 发送消息 → 流式回复 → 思考折叠块可展开；
+  - [ ] 历史会话列表 打开 / 删除 / 导出 正常；
+  - [ ] `/model` `/think` `/memory` `/history` 等内置命令可用；
+  - [ ] 立绘（`stand.png`）显示，虚化滑杆 + 透明滑杆**实时生效**且不卡顿；
+  - [ ] `pytest tests -v` 全绿；
+  - [ ] 对照 `docs/TEST_CHECKLIST.txt` 逐项通过（标注不适用的项）。
+- **禁止**：引入任何动效 / Live2D / 视频依赖；改动 `core/brain.py` 的工具循环逻辑；改目录名。
+
+### M1b — 移除 QQ 适配器（项目边界收敛 · 立即执行）
+
+- **目标**：妹抖酱成为**纯桌面应用**，项目内**不留任何 QQ 痕迹**（依据 §1.1）。
+- **前置**：M1 完成（`ui_qt/` 可用）。
+- **背景**：QQ 能力已由独立项目 `WhaleGirlQQ` 承担，不再需要本项目内置适配器。
+- **删除清单**：
+  1. `qq/` 整个目录（`__init__.py` / `onebot_client.py` / `qq_bot.py` / `run.py` / `config.toml` / `persona.toml` / `__pycache__`）；
+  2. `启动妹抖酱QQ.bat`；
+  3. `adapters/` 目录（仅空 `__init__.py`、全项目无引用）；
+  4. `config/adapters.toml`（**无任何 .py 加载它**；且含明文 token，见下）；
+  5. `requirements.txt` 中 QQ 段：`websockets==15.0.1` 及其注释（约第 35–36 行）；
+  6. 旧打包产物 `dist/`、`build/` 中的历史副本（含明文 token，**重建前先清**）。
+- **修改清单**：
+  1. `启动妹抖酱.bat`：改为**只启动桌面**——删除标题里的"+ QQ"、`[3/4] SnowLuma 检查` 整段、第二个 `start "Meido-QQ" ...`、以及帮助文字里的 Meido-QQ 行；步骤编号顺延为 `[1/3]~[3/3]`；
+  2. `README.txt`：删除 QQ 相关条目（约第 16 行 QQ 适配器、第 56–59 行 QQ 启动方式、第 124 行目录树中的 `qq/`）；
+  3. `docs/TEST_CHECKLIST.txt` 第 23 行：去掉 `Meido-QQ 适配器窗口` 预期；
+  4. `docs/UPGRADE_PLAN.txt`（约 203–204、344 行）：QQ 适配器占位标注为「已拆分为独立项目 `WhaleGirlQQ`」；
+  5. 注释措辞（**非功能改动**，改完跑测试）：
+     - `core/engine.py`：`respond_once()` docstring 里「QQ 群"天气/搜索"」→「外部适配器（如"天气/搜索"硬触发包装）」；**方法本身保留**（未来适配器可能复用，不得删除）；
+     - `core/brain.py` 顶部注释里的 `main.py / qq/run.py / 各类脚本` → 去掉 `qq/run.py`；
+     - `core/logging_utils.py` 同类注释；
+     - `core/history_retrieval.py` 中「web/QQ 共享」→「多入口共享」；
+     - `core/message_bus.py` 事件流注释里的 `gradio_chat` → 改为桌面 UI 名称（Gradio 已移除）。
+- **安全（必须做）**：
+  - `config/adapters.toml` 的 `[adapters.qq]` 含**明文** `http_token` / `ws_token`，且已随 `dist/` 副本扩散。
+  - 处置：删除该文件后，**轮换这两个 token**（在 SnowLuma 侧重新生成），并确认 `WhaleGirlQQ` 的同类明文一并清理。
+  - 报告方式：只报「文件 + 字段名」，**不得回显 token 值**（§8-4）。
+- **交付物**：无 QQ 残留的纯桌面项目 + 精简后的依赖清单。
+- **验收清单**：
+  - [ ] 全项目（`.py` / `.toml` / `.bat` / `.md`）搜索 `qq` / `QQ` / `OneBot` / `websockets` / `SnowLuma` **无非预期残留**（文档中"已拆分"的说明性文字除外）；
+  - [ ] `python main.py` 正常启动，功能不回归；
+  - [ ] `pytest tests -v` 全绿；
+  - [ ] 重新打包后，产物目录**不含** `qq/`、`websockets`；
+  - [ ] 启动脚本只打开**一个**桌面窗口。
+- **禁止**：
+  - 删除 `core/engine.py::respond_once()`（保留为公共 API）；
+  - 顺手改动 M4 才该做的工具/存储抽象；
+  - 在本项目里新增任何"替代 QQ"的适配器。
+
+### M1.5 — 外观与素材体验（可选，可并入 M1）
+
+- **目标**：主题包、素材拖拽导入、暗色主题。
+- **改动点**：`assets/theme.toml` + `assets/default/`；拖拽识别；暗色令牌。
+- **验收**：切换主题包生效；拖入 png 自动注册为立绘；暗色下无对比度问题。
+- **禁止**：为拖拽引入重型依赖。
+
+### M2 — 能打包成 exe
+
+- **目标**：PyInstaller `--onedir` 产出可运行目录，拷到另一台（装了 Ollama）能跑。
+- **前置**：**必须先完成 §4.2 `core/paths.py` 并全项目替换相对路径**。
+- **改动点**：
+  1. `core/paths.py` + 全项目路径替换。
+  2. `build/meido.spec` + `build/build.bat`。
+  3. 首次启动自检：Ollama 连通性、`bge-m3`、对话模型、API Key；缺失给人话指引（不抛栈）。
+  4. 无控制台模式 + 文件日志 + 「查看日志」「打开数据目录」菜单项。
+- **打包要点**：
+  - `--onedir --noconsole`；`--name meido`（**ASCII 名**，交付时再改名为 `妹抖酱v0.1.exe`，见 §7.6）；
+  - `--collect-data jieba`（词典）、`--collect-all chromadb`、`--collect-submodules lxml`（视报错再调）；
+  - `hiddenimports` **必须覆盖所有插件第三方依赖**（`requests`、`bs4`、`yaml`、`duckduckgo_search`、`lxml`、`readability`、`markdownify`…），因为插件是**动态 import**，静态分析看不到；
+  - 图像插件 `qwebp` / `qgif` / `qjpeg` 必须打包（`--exclude` 时别误删）；
+  - `--exclude-module`：`gradio`、`torch`、`tkinter`、`QtWebEngine*`、`QtMultimedia*`；
+  - **M1b 已移除 QQ**：确认 `qq/` 不存在、`websockets` 未出现在依赖，避免被 PyInstaller 连带收集；
+  - `config/ plugins/ workspaces/ assets/ data/` **外置**在 exe 同级，不打包进 exe。
+- **验收清单**：
+  - [ ] 产出目录里 `meido.exe` 双击可启动；
+  - [ ] **拷贝整个目录到另一台电脑**（需装 Ollama）能跑通对话；
+  - [ ] 首次启动自检能正确识别「Ollama 未运行 / 模型缺失 / Key 未填」并给指引；
+  - [ ] 日志文件生成、可打开；用户数据写在 exe 同级目录；
+  - [ ] 打包后冒烟：启动 → 发一条消息 → 退出，无异常。
+- **禁止**：用 `--onefile`；把 `config/` 塞进 exe。
+
+### M3 — 好迁移
+
+- **目标**：交付一个"拷走就能用"的便携文件夹。
+- **改动点**：配置/插件/素材/数据全部外置校验；一键备份/恢复；`README` 更新为 exe 使用说明。
+- **验收**：新机器上：解压 → 装 Ollama → 双击 → 按自检指引配置 → 正常对话。
+- **禁止**：把用户数据写进 `%APPDATA%`（破坏便携性）。
+
+### M4 — 抽象地基（MCP / SQL 的共同前置）
+
+- **目标**：统一 `ToolRegistry`、抽 `Repository` 协议、接线 `MessageBus`。**纯重构，功能不变**。
+- **前置**：M1 稳定。
+- **改动点**：§4.3 / §4.4 / §4.5 全部落地；`plugins/manager.py::execute_tool` 的 `if cmd ==` 大链改为 provider 分发；`require_approval` 复活。
+- **验收清单**：
+  - [ ] 现有全部工具（内置 + 插件）行为**与重构前一致**；
+  - [ ] 新增一个测试 Provider 能注册并执行；
+  - [ ] 危险工具触发 `TOOL_BEFORE_EXECUTE`，UI 可拒绝；
+  - [ ] `TOOL_AFTER_EXECUTE` 能写到审计（先内存/JSON）；
+  - [ ] `AGENT_*` 事件能驱动 StageView；
+  - [ ] `pytest` 全绿。
+- **禁止**：顺手改业务逻辑；引入 MCP/SQL 依赖。
+
+### M5 — MCP 接入
+
+- **目标**：能连外部 MCP Server，其工具出现在 `ToolRegistry` 中。
+- **前置**：M4 完成。
+- **改动点**：§4.6 全部；先打通 **1 个 stdio server**（建议 `filesystem`）。
+- **验收清单**：
+  - [ ] `mcp.toml` 配置生效，server 启动/退出干净（无残留进程）；
+  - [ ] `mcp__<server>__<tool>` 出现在模型可调用工具列表并**能真实执行**；
+  - [ ] 写类工具默认需审批；
+  - [ ] server 崩溃能重启；缺失 `npx` 时给人话提示；
+  - [ ] 桥接层有单元测试。
+- **禁止**：把 asyncio 桥接逻辑散落到业务代码（必须独立模块）。
+
+### M6 — SQL 接入
+
+- **目标**：数据层迁移到 SQLite，通过 `SqlRepository` 实现。
+- **前置**：M4 完成。
+- **改动点**：§4.7 全部；JSON → SQL 迁移脚本；双写灰度开关。
+- **验收清单**：
+  - [ ] 迁移前后会话/记忆/成员数据**完全一致**；
+  - [ ] `schema_version` 自愈生效（旧库自动升级）；
+  - [ ] 迁移前自动备份；
+  - [ ] 可一键切回 JSON 后端（回滚）；
+  - [ ] 审计表能查到 M4 之后的工具调用记录；
+  - [ ] `pytest` 全绿。
+- **禁止**：原地覆盖用户数据；无备份迁移。
+
+### M7 — 减重与优化（可选）
+
+- 评估用轻量向量后端替换 ChromaDB（`core/history_retrieval.py`、`plugins/knowledge_base/main.py`、`plugins/web_search/cache_manager.py` 三处）。
+- PySide6 体积裁剪；可选 Nuitka。
+
+---
+
+## 7. 打包规范
+
+1. **模式**：`--onedir`。理由：启动快、无临时解压、`config/plugins/assets/data` 可外置、杀软误报低。
+2. **入口**：`main.py`。**不做** `--onefile`。
+3. **控制台**：发布用 `--noconsole`（`console=False`）。**发布版的后台调试窗口改为运行期可选开启**，
+   由 `config/bot.toml` 的 `[logging] show_console` 控制（默认 `false`）：
+   置 `true` 时 `core/console_window.py` 用 `AllocConsole()` 分配控制台并重定向输出 ——
+   同一个 exe，不用换产物。**不采用** `console=True` + 启动后 `ShowWindow(SW_HIDE)`：
+   那样系统会先分配控制台再被隐藏，用户必然看到一次黑窗闪烁。
+   `build.bat debug`（`console=True`）仍保留，但用途收窄为「PyInstaller bootloader 阶段
+   就崩了」的场景 —— 那是 `AllocConsole()` 覆盖不到的阶段。
+4. **外置目录**（不打包）：`config/`、`plugins/`、`workspaces/`、`assets/`、`data/`。
+5. **必须打包**：引擎全部 Python 依赖、`jieba` 词典、`chromadb` 数据、Qt 图像插件（`qwebp`/`qgif`/`qjpeg`）。
+6. **中文 exe 名**：构建用 ASCII 名（`meido.exe`），交付时重命名为 `妹抖酱v0.1.exe`；**exe 所在路径建议纯 ASCII**（中文路径在部分工具链上会出问题）。
+7. **交付形态**：`妹抖酱v0.1.zip`（整个 onedir 目录）或 Inno Setup 安装包。
+8. **杀软**：onedir + 不压缩壳，降低误报；若仍误报，考虑代码签名。
+
+---
+
+## 8. 工程规范（铁律）
+
+1. **不回归**：改造不得破坏现有可用功能。关键功能清单：
+   - 多工作空间 创建/切换/隔离（知识库、历史、记忆、人设）
+   - 插件系统 + 热重载
+   - 流式回复 + 工具调用循环
+   - 双层记忆：概览卡（概览层，常驻 system prompt）/ 历史向量检索（细节层，按需注入）
+   - 内置命令：`/model` `/think` `/effort` `/memory` `/history` `/pin` `/remember` `/plugin_reload`
+2. **小步可验证**：每改一个主题即验证；禁止一次性大重构。
+3. **不臆造**：不确定标「待确认」；不得谎报"已修复/已测试通过"。
+4. **密钥安全**：发现明文 token/API Key，只报「文件:行 + 类型」，**不回显**；改为环境变量 / `.env` + `.gitignore`。**已知问题（M1b 处理）**：本项目 `config/adapters.toml` 的 `[adapters.qq]` 与独立项目 `WhaleGirlQQ/config.toml` 均含**明文** `http_token` / `ws_token`，且已随 `dist/` 产物扩散 → 删除后**必须轮换**（见 §6-M1b）。
+5. **异常与日志**：关键路径 `try/except` + 分级 `logging`；**禁止**用 `print` 做正式日志；异常不得静默吞掉。
+6. **类型注解 / docstring**：关键函数必加。
+7. **配置与代码分离**：配置走 `toml`/`env`，禁止硬编码。
+8. **测试**：核心纯逻辑（配置解析、文本清洗、去重、触发器匹配、上下文组装、token 估算、路径解析）必须有 pytest。
+9. **依赖**：固定版本（`==`）；新增依赖必须说明理由。
+10. **中文**：注释、日志、交互文案用中文（与现状一致）。
+
+---
+
+## 9. 风险登记册
+
+| # | 风险 | 概率 | 影响 | 缓解 | 触发信号 |
+|:--:|------|:--:|:--:|------|------|
+| R1 | 冻结后相对路径错乱 | 高 | 高 | **M2 前置强制完成 `core/paths.py`** | exe 里找不到 config/workspaces |
+| R2 | 插件动态 import 未被 PyInstaller 收集 | 高 | 高 | 显式 `hiddenimports` + 打包后冒烟 | `ModuleNotFoundError` |
+| R3 | `QGraphicsBlurEffect` 卡顿 | 中 | 中 | 缓存图层 + 降采样 + 松手精算 | 拖滑杆掉帧 |
+| R4 | MCP 的 asyncio 与同步线程冲突 | 高 | 高 | 独立桥接模块 + 单测 | 死锁 / 事件循环报错 |
+| R5 | SQL 迁移丢数据 | 中 | 高 | 先备份 + 双写灰度 + 可回滚 | 迁移后条数不符 |
+| R6 | 中文 exe 名 / 中文路径异常 | 低 | 中 | ASCII 二进制名 + ASCII 路径 | 启动失败 |
+| R7 | 抽象层过度设计 | 中 | 中 | M4 只做 3 个抽象，不扩散 | 改动面失控 |
+| R8 | Live2D 许可（未来） | — | 中 | 保持"仅预留"，接入前确认 Cubism 许可 | — |
+| R9 | 明文 token 已扩散到 `dist/` 副本 | 高 | 高 | M1b 删除配置并**轮换** token；清理旧产物 | token 出现在产物目录 |
+
+---
+
+## 10. 阶段回报模板（执行方每阶段结束必填）
+
+```markdown
+## 里程碑 Mx 回报
+- 状态：完成 / 部分完成 / 阻塞
+- 改动文件：<列表>
+- 新增依赖：<列表，含版本与理由>
+- 验收结果：<逐条勾选，附命令与输出>
+- 已知问题 / 待确认：<列表>
+- 下一步建议：
+```
+
+**遇到阻塞或本文档未覆盖的决策 → 停止并回报，不要自行决定。**
+
+---
+
+## 11. 附录：代码基线事实（供执行方快速定位）
+
+> ⚠️ 本表记录的是 **M1 之前的基线**。M1 / M1b 执行后会部分过期（例如 `ui/` 已删除、`qq/` 已移除）。执行方**开工前请以实际代码为准重新核对本表**，不要直接照搬。
+
+| 事项 | 事实 | 对本次的影响 |
+|------|------|------|
+| Gradio 耦合面 | 仅在 `ui/chat_page.py`（约 593 行）+ `_test_render.py`（临时文件） | M1 只需重写 1 个文件 + `main.py` |
+| 引擎接口 | `core/engine.py::respond()` 是生成器，yield `(msg, history, api_state)`；另有 `respond_once()`、`switch_workspace()`、`create_workspace()` | 天然适配 Qt「后台线程 + Signal」 |
+| Embedding | `core/history_retrieval.py` 走 **Ollama `/api/embed`（`bge-m3`）**，**进程内无 torch / sentence-transformers** | 打包重大利好，务必保持 |
+| `MessageBus` | `core/message_bus.py` 定义了事件，但**全项目从未实例化（死代码）** | M4 接线 |
+| `require_approval` | `core/plugins/interface.py::ToolDefinition` 声明了但**无人读取** | M4 复活 |
+| 工具机制 | **三套平行**：`core/brain.py::BUILTIN_TOOLS`、插件 `manifest.json#tools[]`、插件 `register_commands()`；执行侧靠 `plugins/manager.py::execute_tool` 的 `if cmd ==` 大链 | M4 统一为 `ToolRegistry` |
+| MCP 现状 | 已有**服务端**（`plugins/knowledge_base/mcp_server.py`，FastMCP，工具 `kb_mcp`）；**客户端完全没有** | M5 补客户端，服务端保留 |
+| 存储现状 | `workspace/storage.py` 是手写 Repository（TOML 后端）；SQLite 仅间接出现（Chroma 内部） | M4 抽协议，M6 接 SQL |
+| 路径现状 | 大量相对路径：`Path("config")` / `Path("workspaces")` / `Path("plugins/knowledge_base/chroma_db")` | **M2 头号必改项** |
+| 测试现状 | `tests/`（4 个 pytest 文件）+ `pytest.ini` 已存在；`docs/TEST_CHECKLIST.txt` 为人工清单 | 每阶段跑 `pytest tests -v` |
+| 依赖现状 | `requirements.txt` **未锁版本** | 打包时锁版本 |
+| 疑似死/旧文件 | 根目录 `ai_brain.py`、`_fix_emoji.py`、`_test_render.py`；目录 `brainB/`、`WhaleGirl_v2 lib/` | M1 确认无引用后清理（**先报告再删**） |
+| 已清理 | 根目录 `memory.py`（整段摘要层，零调用者、零落盘，已被 `core/memory/profile_cards.py` 取代）与配置项 `[persona.memory]` | 已删；`tests/test_context_engine.py` 有负向断言守住不再长回来 |
+| 立绘现状 | `plugins/static_stand/` 仅 `get_stand_image()` 返回 `stand.png`，manifest 写"为未来 Live2D 准备" | 升级为 `MediaSource` 实现 |
+| QQ 适配器 | 本项目 `qq/`（复用 meido 引擎 + OneBot v11）与独立项目 `WhaleGirlQQ`（自带 `whalegirl` 包）是**两套实现**；`qq/` 仅自引用，`main.py` **不依赖**它 | **M1b 移除本项目 `qq/`**（低风险）；QQ 统一由 `WhaleGirlQQ` 承担 |
+| 适配器配置 | `config/adapters.toml` 含 `[adapters.qq]` 明文 token；**无任何 .py 加载该文件**（`gradio_chat` / `gradio_admin` 段在 M1 后已失效，属陈旧配置） | M1b 整文件删除 |
+
+---
+
+*本文档为唯一权威技术路线。执行方开工前请先通读全文 + 附录，再按 M1 开始。*

@@ -1,0 +1,18 @@
+# ── 外观配置 ──
+# 本文件由「设置 → 外观」界面写入，也可手工编辑（改完重启妹抖酱生效）。
+#
+#   [theme]          preset = 亮色 / 深色 / 初音 / 自定义
+#   [theme.tokens]   仅当 preset = "自定义" 时读取：18 个语义色的完整色表
+#   [effects]        窗口不透明度 / 背景虚化 / 立绘景深
+#
+# preset 是预设名时，色值从程序内置的预设取（预设日后改进会自动跟上）；
+# 在色轮面板里改动任意颜色后，preset 会变成「自定义」，色值写进 [theme.tokens]。
+# 令牌键名与含义见 ui_qt/theme.py 的 TOKEN_LABELS。
+[theme]
+preset = "亮色"
+
+[effects]
+preset = "标准"
+window_opacity = 0.98
+backdrop_blur = 8.0
+stand_depth = 0.0

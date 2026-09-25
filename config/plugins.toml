@@ -1,0 +1,23 @@
+[plugins]
+directory = "plugins"
+disabled = []
+
+[plugins.web_search]
+enabled = true
+# 注意：真正生效的代理配置在 plugins/web_search/config.yaml 的 proxy 段
+# （插件内 _load_config() 优先读 config.yaml）。下面两项仅为兼容保留，
+# 端口必须与 config.yaml 保持一致，否则会出现"改这里不生效"的错觉。
+proxy_http = "http://127.0.0.1:7897"
+proxy_https = "http://127.0.0.1:7897"
+
+[plugins.knowledge_base]
+enabled = true
+
+[plugins.file_explorer]
+enabled = true
+
+[plugins.image_processor]
+enabled = true
+comfyui_url = "http://127.0.0.1:8188"
+output_dir = "data/generated"
+generation_timeout = 120

@@ -1,0 +1,85 @@
+# ── Live2D 立绘配置 ──
+#
+# 只写「用哪个模型」和「对话状态 → 动作/表情」的映射；改完重启妹抖酱生效。
+# 动作名 = motions/ 下的 *.motion3.json 去掉扩展名
+# 表情名 = 模型目录下的 *.exp3.json 去掉扩展名
+
+[model]
+# 模型目录（相对项目根）
+dir = "assets/live2d/DS鲸鱼娘"
+# 模型定义文件（在 dir 下）
+definition = "c_0120.model3.json"
+# 播放器页面（相对项目根）
+viewer = "assets/live2d/viewer/index.html"
+# 模型加载不出来时是否回退到静态立绘（plugins/static_stand/stand.png）
+fallback_to_static = true
+
+[behavior]
+# 进入 idle 时是否清掉当前表情（true = 回到默认脸）
+clear_expression_on_idle = true
+
+# 说明：状态**不做最短停留**，阶段到了就切。
+# 短回复下「拿到结果」的表情可能一闪而过，但它的动作（motion）是一次性的，
+# 触发后自己会播完；长回复下「输出中」会一直保持到本轮结束。
+# 想调整观感就换表情/动作，别再加时间门槛 —— 加过，会把后续状态整段挡掉。
+
+# ── 交互 ──
+[interaction]
+# 点击立绘时依次轮换的表情（点一下换一个，循环）。
+# 点完 2 秒后会自动恢复成当前对话状态对应的表情。
+click_expressions = ["调皮", "吐舌", "爱心眼", "星星眼", "脸红"]
+# 点击后多少秒恢复状态表情；0 = 不恢复（一直保持被点出来的那个）
+click_revert_seconds = 2.0
+# 视线跟随系数：0~1，越小头/眼转动越轻微。之前是直接喂原始坐标（≈1.0）太灵敏。
+focus_gain = 0.35
+# 停止移动多少秒后视线回正（回到初始的正前方）；0 = 不回正，一直盯着最后的位置
+focus_rest_seconds = 1.2
+
+# ── 阶段 → 动作 / 表情 ──
+#
+# 状态名来自引擎上报的**对话阶段**（core/brain.py 的 _phase_event），
+# 不再从展示文本反推（展示文本是给人看的，引擎分支一变就失准）：
+#   thinking   正在想（含推理流、等首 token）
+#   tool       正在调工具
+#   found      这一轮的工具都返回了 ——「哦，拿到了」的真实时刻
+#   writing    正文在流
+#   idle       空闲 / 本轮结束
+#   error      出错
+#
+# 可用动作：aidale / chuipaopao / idle / 喷水 / 开盖 / 番茄酱 / 自拍 / 自拍简单
+# 可用表情：感叹号 / 星星眼 / 爱心眼 / 脸红 / 生气 / 悲伤 / 哭 / 调皮 / 吐舌 /
+#           晕晕 / 流汗 / 问号 / 阴暗 / 吐魂 / 呆呆眼 / 撤回 / 魔爪 / 鲸鱼 /
+#           love / 兔兔贴纸 / 单边马尾 / 双手比耶 / 喵喵手~喵~动画 / 圆眼镜 /
+#           墨镜 / 头箍 / 巴菲 / 心跳 / 情绪花花 / 手机换色 / 挤 / 方眼镜 /
+#           椭圆眼镜 / 橡皮 / 深色桌布 / 点菜按下 / 猫猫贴纸 / 画笔 / 蛋包饭 /
+#           蝴蝶结贴纸 / 闭眼口水 / 魔爪换色 / 鲸鱼放桌上
+# 空字符串 = **清掉表情、回到模型默认脸**；想「保持当前表情不动」就把那一行整行删掉。
+# 动作留空则继续播 idle。
+
+[state_map.idle]
+motion = "idle"
+expression = ""
+
+# 正在想 → 发呆的样子（瞳孔缩小、像在处理）
+[state_map.thinking]
+motion = ""
+expression = "呆呆眼"
+
+# 正在调工具 → 努力干活
+[state_map.tool]
+motion = ""
+expression = "流汗"
+
+# 工具返回了 → 「哦，拿到了」
+[state_map.found]
+motion = "喷水"
+expression = "星星眼"
+
+# 正文在流 → 举着笔在写
+[state_map.writing]
+motion = ""
+expression = "画笔"
+
+[state_map.error]
+motion = ""
+expression = "晕晕"

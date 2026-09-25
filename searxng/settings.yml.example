@@ -1,0 +1,34 @@
+# ═══════════════════════════════════════════════════════════
+# SearXNG 配置（示例模板）
+# ═══════════════════════════════════════════════════════════
+#
+# 用法：复制为同目录下的 settings.yml，并替换 secret_key
+#
+#     cp searxng/settings.yml.example searxng/settings.yml
+#     openssl rand -base64 32        # 生成一个随机 secret_key
+#
+# 真正的 settings.yml 含明文 secret_key，已被 .gitignore 忽略。
+#
+# 注意：SearXNG 是**可选**的。妹抖酱默认走 DuckDuckGo / 必应中国直连，
+#      不启动 SearXNG 也能正常联网搜索（见 plugins/web_search/config.yaml）。
+
+use_default_settings: true
+
+general:
+  instance_name: "SearXNG"
+  debug: false
+  privacypolicy_url: false
+
+search:
+  safe_search: 0
+  autocomplete: "google"
+  formats:
+    - html
+    - json
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  # ⚠️ 必须替换：openssl rand -base64 32
+  secret_key: "CHANGE_ME"
+  limiter: false

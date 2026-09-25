@@ -1,0 +1,35 @@
+crawler:
+  max_depth: 3
+  max_pages: 50
+  rate_limit: 1.0
+  timeout: 15
+  user_agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
+    like Gecko) Chrome/125.0.0.0 Safari/537.36
+presets:
+  api-docs.deepseek.com:
+    content_selector: article, .content, main, .markdown-body
+    exclude_selectors: nav, .sidebar, footer, .toc, .header
+  docs.python.org:
+    content_selector: article, div.body, .document
+    exclude_selectors: nav, .sidebar, .related, .footer
+  github.com:
+    content_selector: article, .markdown-body, .readme, .Blob
+    exclude_selectors: nav, .Header, .footer, .file-navigation, .sidebar
+# ── 代理 ──
+# 默认**不写死地址**：留空时由 deep_crawler._get_proxy() 自动按优先级探测
+#   ① 本段显式配置（若填写）→ ② 系统代理 / 环境变量（HTTP_PROXY / HTTPS_PROXY）
+#   → ③ Clash 等本地常见端口（7897 / 7890）
+# 需要固定代理时再取消下面两行注释（填写后仍会先探活，连不上会自动降级，不会卡死）
+# proxy:
+#   http: http://127.0.0.1:7897
+#   https: http://127.0.0.1:7897
+
+search:
+  bing_cn_url: https://cn.bing.com/search
+  # 默认走 duckduckgo 通道：内部是多级降级（本机 SearXNG → 必应中国直连 → DuckDuckGo
+  # → 公共 SearX 实例），主力是必应中国直连，**无需 API Key、无需代理**。
+  # google / bing 两个引擎依赖官方 API：Google CSE 已对新客户关闭注册，
+  # Bing Search API 已于 2025-08-11 完全退役，因此不作为默认值。
+  default_engine: duckduckgo
+  max_results: 5
+  searxng_url: http://127.0.0.1:8080

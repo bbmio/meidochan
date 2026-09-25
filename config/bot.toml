@@ -1,0 +1,20 @@
+[bot]
+name = "妹抖酱"
+version = "0.1.0"
+user_id_source = "hostname"
+max_input_length = 8000
+api_state_trim_length = 40
+
+[paths]
+conversations = "conversations"
+memory = "data/memory"
+sandbox = "data/sandbox"
+
+[logging]
+level = "INFO"
+# 后台调试窗口（控制台）：
+#   false（默认）= 启动时不开控制台窗口，发布观感干净；print 与日志仍全部落盘
+#   true         = 启动时额外分配一个控制台窗口，实时看日志与 print
+# 打包版与源码版读的都是这一项，改完需重启生效。
+# 详细日志：data/logs/meido.log
+show_console = false

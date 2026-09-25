@@ -1,0 +1,375 @@
+# 鲸鱼娘 V2 多模态智能体升级计划书
+
+> 基于 llmenv + LocalMind + Agent Embodiment 三位一体架构
+> 日期：2026-07-23
+
+---
+
+## 一、技术对标分析
+
+| 鲸鱼娘 V2 需求 | 对标项目 | 核心能力 | 适配方案 |
+|:---|:---|:---|:---|
+| **上下文/身份管理** | [llmenv](https://github.com/RohanKaranjee/llmenv) v2.0 | identity/profile/project/pins 分层 YAML 上下文 | 升级 `core/config/` TOML 系统 + `persona.toml` |
+| **本地知识引擎** | [LocalMind](https://github.com/ixxrllg/localmind) | BM25 + Embeddings 混合检索、MCP Server、import graph | 升级 `plugins/knowledge_base` 插件 |
+| **虚拟形象具身化** | [live2d-embodied-avatar](https://github.com/devnanix/live2d-embodied-avatar) | 6种 Agentic States、声明式 JSON 动画、WebSocket 同步 | 升级 `plugins/static_stand` + 新增 `plugins/live2d_embodiment` |
+| **AI 绘画/图像处理** | ComfyUI | 自定义工作流、文生图/图生图/编辑 | 新建 `plugins/comfyui_processor` |
+| **多平台适配** | NachoBot 架构 | Core + Adapter 模式、插件系统 | 新建 `adapters/` 占位 |
+
+---
+
+## 二、六大模块详细设计
+
+### 模块 1：llmenv 式上下文引擎
+
+**对标功能：**
+- `llmenv identity` → 用户身份和偏好持久化
+- `llmenv init` → 项目级别上下文初始化
+- `llmenv scan` → 自动检测技术栈和环境
+- `llmenv profile` → 按任务切换上下文（build/review/debug/refactor）
+- `llmenv pin` → 持久化规则和纠正
+
+**适配设计：**
+
+```
+config/
+├── identity.toml          # 全局身份（跨项目持久化）
+│   ├── [user]             # 用户名/偏好/城市/笔记
+│   ├── [preferences]      # 代码风格、语言偏好、回复风格
+│   └── [pins]             # 全局规则（"永远不要用英文回复"）
+├── persona.toml            # 人设（已存在，需升级）
+│   └── [profiles]         # 新增多模式支持
+│       ├── [profiles.chat]      # 日常聊天模式
+│       ├── [profiles.coding]    # 编程辅助模式
+│       ├── [profiles.review]    # 代码审查模式
+│       └── [profiles.teaching]  # 教学模式
+└── plugins.toml            # 插件上下文
+```
+
+**新增组件：`core/context_engine.py`**
+- 启动时自动扫描项目结构（技术栈检测）
+- 运行时根据用户消息自动切换 profile
+- Pins 系统：将用户纠正持久化为规则注入 system prompt
+- 优先级链：全局 pins > profile rules > persona defaults
+
+---
+
+### 模块 2：LocalMind 式本地知识引擎
+
+**对标功能：**
+- 行感知分块（line-aware chunker）
+- BM25 倒排索引 + Embeddings 混合检索
+- import/link 关系图谱
+- MCP Server 暴露工具
+- SQLite 本地存储，零网络依赖
+
+**适配设计：**
+
+```
+plugins/knowledge_base/     # 现有插件全面升级
+├── manifest.json            # 新增工具定义
+├── main.py                  # 保留 ChromaDB 向量检索
+├── bm25_indexer.py          # 新增 BM25 分词+倒排索引
+├── hybrid_search.py         # 新增 BM25×Embedding 混合检索
+├── relation_graph.py        # 新增 文件依赖关系图
+└── mcp_server.py            # 新增 MCP Server（stdio 协议）
+```
+
+**新增工具：**
+
+| 工具名 | 功能 | 对标 LocalMind |
+|:---|:---|:---|
+| `kb_search` | 混合检索（BM25 + 向量 + 重排序） | `search_code` |
+| `kb_ask` | 带引用的问答 | `ask_codebase` |
+| `kb_related` | 查找依赖关系 | `find_related_files` |
+| `kb_explain` | 解释文件/行范围 | `explain_file` |
+| `kb_status` | 索引统计 | `index_status` |
+| `kb_reindex` | 增量/全量重建 | `reindex` |
+| `kb_mcp` | 启动 MCP Server | — |
+
+**技术栈：**
+- BM25：使用 `rank_bm25` Python 库，分词用 jieba（中文优化）
+- 混合检索：BM25 score × 0.3 + Vector cosine × 0.7（可配置权重）
+- MCP Server：FastMCP Python 库，stdio 协议
+- 存储：ChromaDB（向量）+ SQLite（BM25 倒排表 + 关系图）
+
+---
+
+### 模块 3：Agent Embodiment（Live2D 具身化）
+
+**对标功能：**
+- 6 种 Agentic States：idle / thinking / working / responding / error / surprise
+- 声明式 JSON 动画参数（Static + Drift）
+- WebSocket 状态同步
+- Live2D Cubism SDK 驱动
+
+**适配设计：**
+
+```
+plugins/live2d_embodiment/   # 新增插件
+├── manifest.json
+├── main.py                  # 插件入口
+├── state_manager.py         # 状态机（idle/thinking/working/responding/error/surprise）
+├── ws_bridge.py             # WebSocket 服务端（前端状态推送）
+├── states/                  # 状态 JSON 定义（可运行时热加载）
+│   ├── manifest.json
+│   ├── idle.json
+│   ├── thinking.json
+│   ├── working.json
+│   ├── responding.json
+│   ├── error.json
+│   └── surprise.json
+└── webui/                   # Live2D 前端（独立 HTML，嵌入 Gradio iframe）
+    ├── index.html
+    ├── live2d_app.ts        # TypeScript → 编译为 JS
+    ├── Core/                # Cubism SDK Core
+    ├── Framework/           # Cubism SDK Framework
+    └── models/              # 鲸鱼娘 Live2D 模型
+```
+
+**状态触发协议：**
+
+```
+Brain 事件                     → 化身状态
+─────────────────────────────────────────
+收到用户消息                    → thinking
+分发工具调用                    → working
+流式回复开始                    → responding
+回复完成/无工具调用              → idle
+API 异常/工具执行错误            → error
+收到服务端推送                   → surprise
+```
+
+**与现有 Gradio 的集成方式：**
+- Gradio 页面右侧面板嵌入 iframe 显示 Live2D 前端
+- WebSocket 服务端随插件启动，监听独立端口（`9873`）
+- `core/message_bus.py` 的 `MESSAGE_RECEIVED`/`MESSAGE_SEND`/`TOOL_BEFORE_EXECUTE` 事件自动触发状态切换
+- 无需修改 Gradio UI 代码，通过事件总线解耦
+
+**Live2D 模型准备：**
+- 短期：使用 Niziiro Mao 示例模型测试（已有 MIT 许可）
+- 中期：使用 `static_stand/stand.png` 立绘配合简单动画过渡
+- 长期：定制鲸鱼娘 Live2D 模型（需要 Cubism Editor 5）
+
+---
+
+### 模块 4：ComfyUI 图像处理器
+
+**功能：**
+- 文生图（txt2img）：根据描述生成图片
+- 图生图（img2img）：基于上传图片变体
+- 图像编辑（inpaint/outpaint）：局部重绘/扩展
+- 工作流管理：预设工作流模板 + 用户自定义
+
+**适配设计：**
+
+```
+plugins/comfyui_processor/   # 升级现有 image_processor 骨架
+├── manifest.json
+├── main.py                  # 插件入口
+├── comfyui_client.py        # ComfyUI WebSocket API 客户端
+├── workflow_manager.py      # 工作流模板管理
+├── image_handler.py         # 图像上传/下载/预览
+├── workflows/               # 工作流模板
+│   ├── txt2img.json         # 文生图
+│   ├── img2img.json         # 图生图
+│   ├── inpaint.json         # 局部重绘
+│   └── upscale.json         # 超分
+└── generated/               # 生成图片输出目录
+```
+
+**工具定义：**
+
+| 工具名 | 功能 |
+|:---|:---|
+| `image_generate` | 文生图（prompt + 负面提示词 + 尺寸 + 步数） |
+| `image_transform` | 图生图/编辑（输入图片路径 + 提示词 + 强度） |
+| `image_workflows` | 列出可用工作流 |
+| `image_workflow_run` | 运行指定工作流 |
+| `image_status` | 查看 ComfyUI 连接状态和生成进度 |
+
+**ComfyUI 集成要点：**
+- 通信协议：WebSocket（ComfyUI 原生支持 `ws://127.0.0.1:8188/ws`）
+- 进度反馈：通过 WS 消息实时显示生成进度（yield status 事件）
+- 工作流模板：JSON 文件存放预设工作流，运行时替换 prompt/seed 参数
+- 超时控制：`config/plugins.toml` 中配置 `generation_timeout`
+
+---
+
+### 模块 5：适配器预留槽位
+
+```
+adapters/                    # 平台适配器（全部预留）
+├── __init__.py
+├── qq/                       # 已拆分为独立项目 WhaleGirlQQ（本仓库不再提供）
+├── bilibili/
+│   └── __init__.py          # Bilibili 直播适配器（预留）
+├── discord/
+│   └── __init__.py          # Discord 适配器（预留）
+├── tts/
+│   └── __init__.py          # GPT-SoVITS 语音合成（预留）
+└── vlm/
+    └── __init__.py          # 本地视觉大模型（预留）
+```
+
+每个适配器目录包括：
+- `__init__.py`：TODO 注释 + 接口说明
+- `README.txt`：该适配器的设计文档
+- 未来实现时参考 NachoBot 对应适配器的协议设计
+
+---
+
+### 模块 6：消息总线事件扩展
+
+```python
+# core/message_bus.py 新增事件类型
+class EventType(Enum):
+    # 现有
+    MESSAGE_RECEIVED = "message.received"
+    MESSAGE_SEND = "message.send"
+    TOOL_BEFORE_EXECUTE = "tool.before_execute"
+    TOOL_AFTER_EXECUTE = "tool.after_execute"
+    
+    # 新增 — 化身具身化
+    AGENT_THINKING = "agent.thinking"       # 开始推理
+    AGENT_WORKING = "agent.working"         # 工具执行中
+    AGENT_RESPONDING = "agent.responding"   # 流式回复中
+    AGENT_IDLE = "agent.idle"               # 空闲
+    AGENT_ERROR = "agent.error"             # 异常
+    
+    # 新增 — 上下文管理
+    CONTEXT_SCANNED = "context.scanned"     # 技术栈扫描完成
+    PROFILE_CHANGED = "profile.changed"     # 模式切换
+    PIN_TRIGGERED = "pin.triggered"         # 规则匹配触发
+```
+
+---
+
+## 三、实施路线图
+
+### Phase 2：本地知识引擎升级（~3 天）
+- [ ] 安装依赖：`rank_bm25`, `jieba`, `fastmcp`
+- [ ] 实现 `bm25_indexer.py`：中文分词 + 倒排索引
+- [ ] 实现 `hybrid_search.py`：BM25 × Embedding 混合 + 重排序
+- [ ] 实现 `relation_graph.py`：Python import 解析 + 依赖图
+- [ ] 实现 `mcp_server.py`：FastMCP stdio 协议
+- [ ] 更新 knowledge_base manifest 增加新工具
+- [ ] 单元测试
+
+### Phase 3：Agent Embodiment（~2 天）
+- [ ] 下载 Live2D Cubism SDK for Web（手动操作，用户完成）
+- [ ] 实现 `state_manager.py`：6 状态声明式状态机
+- [ ] 编写状态 JSON 配置文件（基于 Niziiro Mao 参数）
+- [ ] 实现 `ws_bridge.py`：WebSocket 服务端
+- [ ] 创建前端 HTML + TypeScript（编译为 JS）
+- [ ] 接入 `core/message_bus.py` 事件 → 状态自动切换
+- [ ] Gradio 嵌入 iframe 展示 Live2D
+
+### Phase 4：上下文引擎 + 管理面板（~2 天）
+- [ ] 实现 `core/context_engine.py`
+- [ ] 新增 `config/identity.toml`
+- [ ] 升级 `config/persona.toml` 支持多 profile
+- [ ] Pins 系统实现
+- [ ] 管理面板：进程管理 + 配置编辑器 + 记忆浏览器
+
+### Phase 5：ComfyUI 图像处理（~1.5 天）
+- [ ] 实现 `comfyui_client.py`：WebSocket API 通信
+- [ ] 实现 `workflow_manager.py`
+- [ ] 预设工作流模板：txt2img / img2img / inpaint
+- [ ] 注册图像处理工具
+- [ ] 进度反馈 + 图片展示
+
+### Phase 6：沙箱 + 誓约系统（~1.5 天）
+- [ ] `core/sandbox/`：文件操作审批流程
+- [ ] 誓约系统：从对话中提取约定 → ChromaDB 存储 → 定时触发
+- [ ] 适配器接口文档
+
+---
+
+## 四、技术风险与缓解
+
+| 风险 | 影响 | 缓解措施 |
+|:---|:---|:---|
+| Live2D SDK 需手动下载 | Phase 3 前置依赖 | Phase 3 可先用纯 CSS 动画过渡方案替代，Live2D 作为 Phase 3.5 |
+| ComfyUI 需独立部署 | Phase 5 前置依赖 | 先实现 API 客户端 + mock 模式测试，后续接入真实服务 |
+| BM25 + ChromaDB 双索引维护 | 存储翻倍、重建变慢 | 增量索引 + 后台异步重建 |
+| MCP Server 协议兼容 | IDE 版本差异 | 严格遵循 MCP 规范，提供多种连接方式配置 |
+
+---
+
+## 五、目录结构总览（最终态）
+
+```
+WhaleGirl_v2/
+├── core/                         # 核心引擎
+│   ├── engine.py                 # 编排器
+│   ├── brain.py                  # AI 大脑
+│   ├── history.py                # 历史管理
+│   ├── message_bus.py            # 事件总线
+│   ├── context_engine.py         # llmenv 式上下文管理 ★
+│   ├── config/
+│   │   ├── models.py
+│   │   └── loader.py
+│   ├── plugins/
+│   │   ├── interface.py
+│   │   └── manager.py
+│   ├── memory/
+│   │   └── __init__.py
+│   └── sandbox/                  # 沙箱 ★
+│       └── __init__.py
+├── plugins/
+│   ├── web_search/               # 联网搜索
+│   ├── knowledge_base/           # 知识库 ★升级
+│   │   ├── main.py               # ChromaDB 向量
+│   │   ├── bm25_indexer.py       # BM25 索引 ★
+│   │   ├── hybrid_search.py      # 混合检索 ★
+│   │   ├── relation_graph.py     # 依赖图 ★
+│   │   └── mcp_server.py         # MCP Server ★
+│   ├── file_explorer/
+│   ├── live2d_embodiment/        # Live2D 具身化 ★
+│   │   ├── main.py
+│   │   ├── state_manager.py
+│   │   ├── ws_bridge.py
+│   │   ├── states/
+│   │   └── webui/
+│   ├── comfyui_processor/        # 图像处理 ★
+│   │   ├── main.py
+│   │   ├── comfyui_client.py
+│   │   ├── workflow_manager.py
+│   │   └── workflows/
+│   └── static_stand/             # 立绘（保留为降级方案）
+├── ui/
+│   └── chat_page.py              # Gradio 聊天
+├── adapters/                     # 平台适配器（预留）
+│   ├── qq/                       # 已拆分为独立项目 WhaleGirlQQ
+│   ├── bilibili/
+│   ├── discord/
+│   ├── tts/
+│   └── vlm/
+├── config/                       # TOML 配置
+│   ├── identity.toml             # 用户身份 ★
+│   ├── persona.toml              # 人设 + 多 profile ★升级
+│   ├── bot.toml
+│   ├── model.toml
+│   ├── plugins.toml
+│   └── adapters.toml
+├── data/                         # 运行时数据
+│   ├── conversations/
+│   ├── memory/
+│   └── sandbox/
+├── main.py                       # 入口
+└── requirements.txt
+```
+
+> ★ 标记为本次新增或重大升级模块
+
+---
+
+## 六、交付物清单
+
+| 阶段 | 核心产出 |
+|:---|:---|
+| Phase 2 | 升级后的 knowledge_base 插件（BM25+混合检索+MCP） |
+| Phase 3 | Live2D 化身（6状态 + WebSocket + 事件总线驱动） |
+| Phase 4 | 上下文引擎 + 多 profile + Pins + 管理面板 |
+| Phase 5 | ComfyUI 图像处理器（文生图/图生图/工作流） |
+| Phase 6 | 沙箱 + 誓约系统 |

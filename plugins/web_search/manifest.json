@@ -1,0 +1,108 @@
+{
+  "name": "web_search",
+  "type": "tool",
+  "entry": "main.py",
+  "description": "智能联网搜索插件，支持多搜索引擎（DuckDuckGo/SearXNG/Google/Bing）、智能缓存、深度抓取（支持续读）、递归爬取",
+  "version": "1.0.0",
+  "config": {
+    "crawler": {
+      "max_depth": 3,
+      "max_pages": 50,
+      "rate_limit": 1.0,
+      "timeout": 15,
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    },
+    "search": {
+      "default_engine": "duckduckgo",
+      "max_results": 5
+    },
+    "presets": {
+      "api-docs.deepseek.com": {
+        "content_selector": "article, .content, main, .markdown-body",
+        "exclude_selectors": "nav, .sidebar, footer, .toc, .header"
+      },
+      "docs.python.org": {
+        "content_selector": "article, div.body, .document",
+        "exclude_selectors": "nav, .sidebar, .related, .footer"
+      },
+      "github.com": {
+        "content_selector": "article, .markdown-body, .readme, .Blob",
+        "exclude_selectors": "nav, .Header, .footer, .file-navigation, .sidebar"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "search",
+      "description": "联网搜索，返回搜索结果摘要和 URL 列表。默认优先用缓存（更快）；用户要“重新搜”“最新数据”时设 force_refresh=true。联网约几秒，有缓存更快。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "搜索关键词，应简洁明了，提取用户问题的核心内容。"
+          },
+          "force_refresh": {
+            "type": "boolean",
+            "description": "是否跳过缓存强制联网搜索，默认 false（优先使用缓存）。"
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "deep",
+      "description": "深度抓取并阅读指定 URL 的网页内容，提取正文并转为 Markdown。url 需 http(s):// 开头；offset 用于续读被截断的长页面。需下载完整网页，大型页面可能 5-15 秒。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "要抓取的网页URL，必须以 http:// 或 https:// 开头。"
+          },
+          "offset": {
+            "type": "integer",
+            "description": "续读偏移量。当上一次抓取内容被截断时，可携带此参数从截断位置继续读取。默认为 0（从头开始）。"
+          }
+        },
+        "required": ["url"]
+      }
+    },
+    {
+      "name": "crawl",
+      "description": "递归爬取指定网站，自动发现并抓取同域名下的子页面。depth 默认 2。适用于了解整个站点结构。耗时较长（受页面数影响，可能几十秒到几分钟），仅确需全站了解时使用；单页内容用 deep 更快。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "起始URL，必须以 http:// 或 https:// 开头。"
+          },
+          "depth": {
+            "type": "integer",
+            "description": "递归深度，默认为 2。通常无需修改。"
+          }
+        },
+        "required": ["url"]
+      }
+    },
+    {
+      "name": "search_config",
+      "description": "查看或修改搜索插件的配置。key：engine（切换搜索引擎）、rate（爬虫限速）、depth（最大深度）；不带参数则查看当前配置。瞬时返回。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "要修改的配置项名称，可选值：engine（切换搜索引擎）、rate（爬虫限速）、depth（最大递归深度）。查看当前值时不填此参数。"
+          },
+              "value": {
+                "type": "string",
+                "description": "新的配置值。engine 可选 duckduckgo（默认，免 Key 多级降级）/ bing_cn（必应中国直连，免 Key）/ searxng；google 与 bing 依赖官方 API（前者已关闭新客户注册、后者已退役），实际不可用。rate 为数字；depth 为整数。"
+              }
+        },
+        "required": []
+      }
+    }
+  ]
+}

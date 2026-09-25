@@ -1,0 +1,56 @@
+{
+    "name": "mcp_client",
+    "version": "1.0.0",
+    "type": "tool",
+    "entry": "main.py",
+    "author": "ShiKi",
+    "description": "MCP 客户端：连接外部 MCP server（stdio），把对方工具动态注册给 AI。默认禁用高风险工具，妹抖酱需向用户申请并获同意后才能启用。",
+
+    "─── 说明 ──────────────────────────────": "",
+    "# server 列表与参数在 config/mcp.toml，不在本文件": "",
+    "# 工具名格式：<server名>__<原工具名>，例如 playwright__browser_navigate": "",
+    "# 高风险工具（config 里的 disabled_tools）默认不暴露；": "",
+    "#   妹抖酱可用 mcp_tool_access 向用户申请，同意后写入 data/mcp_grants.json": "",
+
+    "config": {
+        "grants_file": "data/mcp_grants.json"
+    },
+
+    "tools": [
+        {
+            "name": "mcp_status",
+            "description": "查看 MCP 连接状态：各 server 是否就绪、有多少工具、哪些工具被默认禁用、已授权了哪些。MCP 正在后台启动时也会如实说明。瞬时返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        },
+        {
+            "name": "mcp_tool_access",
+            "description": "申请使用被默认禁用的高风险 MCP 工具。不带参数调用可列出可申请的工具；带 tool 与 reason 调用会生成申请文本，需向用户说明并征得同意后，再带 confirm=true 调一次完成授权；带 revoke=true 可撤销授权。授权后下次对话该工具才可用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "description": "工具名，可写完整名（playwright__browser_run_code_unsafe）或裸名（browser_run_code_unsafe）。不填则列出可申请的工具。"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "申请理由，会原样展示给用户看，请写清为什么需要这个工具。"
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "用户已明确同意后的第二步；未获同意前不要设为 true。"
+                    },
+                    "revoke": {
+                        "type": "boolean",
+                        "description": "设为 true 表示撤销该工具的授权。"
+                    }
+                },
+                "required": []
+            }
+        }
+    ]
+}

@@ -1,0 +1,17 @@
+# 用户身份配置（llmenv 对标）
+# 全局持久化，跨项目生效
+
+[user]
+name = ""
+city = ""
+notes = ""
+
+[preferences]
+language = "zh"
+response_style = "professional"
+code_style = "python"
+
+[pins]
+# 全局规则，优先级最高，会被注入到所有 system prompt 中
+# 每条规则包含：id, rule, scope, created_at
+# scope 可选: global, coding, chat, review

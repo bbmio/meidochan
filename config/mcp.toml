@@ -1,0 +1,37 @@
+# ── MCP 客户端配置 ──
+#
+# 妹抖酱作为 MCP 客户端，连接外部 MCP server（stdio 协议），
+# 把对方提供的工具动态注册给 AI。工具名会加 `<server名>__` 前缀，避免与现有插件重名。
+#
+# 每个 [[servers]] 一项。改完需要重启妹抖酱（插件在启动时加载）。
+
+[settings]
+enabled = true
+# 单个 server 初始化超时（秒）。首次跑 npx 要下载包，实测约 40s，所以别调太小。
+startup_timeout = 120
+# 单次工具调用超时（秒）。浏览器导航等操作可能较慢。
+call_timeout = 120
+
+# ── Playwright 浏览器 MCP ──
+# 提供 25 个浏览器工具：导航 / 点击 / 输入 / 截图 / 无障碍树快照 /
+# 多标签 / 网络监控 / Cookie 与存储状态 等。
+#
+# 关于「用哪个浏览器」：
+#   默认（如下）：Playwright 启动自己的 Chrome 实例，profile 持久化，
+#                 开箱即用，但**没有你日常浏览器的登录态**。
+#   想用你真实 Chrome 的登录态：在 args 里加 "--cdp-endpoint=chrome"，
+#     然后到 chrome://inspect/#remote-debugging 勾选一次「允许远程调试」即可
+#     （无需特殊参数启动 Chrome，也不用先关掉 Chrome）。
+#   或者改用扩展模式：args 加 "--extension"（需先装 Playwright 浏览器扩展）。
+[[servers]]
+name = "playwright"
+enabled = true
+command = "npx"
+# --output-dir 放在 data/ 下（该目录已在 .gitignore 里），避免快照文件散落到项目根目录。
+# 相对路径以项目根为基准（插件会把子进程 cwd 固定为项目根）。
+args = ["-y", "@playwright/mcp@latest", "--output-dir=data/mcp_output"]
+
+# 默认禁用、需要你点头才能用的工具。
+# browser_run_code_unsafe 能在浏览器进程里跑任意 Playwright JS，等价于远程代码执行，
+# 所以默认不给。妹抖酱需要时得先用 mcp_tool_access 向你申请，你同意后才解锁。
+disabled_tools = ["browser_run_code_unsafe"]

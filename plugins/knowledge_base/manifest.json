@@ -1,0 +1,91 @@
+{
+    "name": "knowledge_base",
+    "version": "2.0.0",
+    "type": "tool",
+    "entry": "main.py",
+    "author": "ShiKi",
+    "description": "本地知识库（BM25+语义混合检索），支持 txt/md/py/json/pdf/docx/图片OCR，ChromaDB+BM25双引擎，增量索引，MCP Server",
+    "config": {
+        "index_folders": [
+            "./knowledge_lib"
+        ],
+        "chunk_size": 500,
+        "chunk_overlap": 50,
+        "hybrid_weights": {
+            "bm25": 0.3,
+            "vector": 0.7
+        }
+    },
+    "tools": [
+        {
+            "name": "kb_search",
+            "description": "在知识库中语义检索相关片段（ChromaDB 向量）。当用户想查找本地存储的文档内容或知识时使用。本地检索，秒级返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词或问题"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "kb_rebuild",
+            "description": "重建知识库索引（BM25 + ChromaDB 双引擎）。会清空并重新索引所有配置目录下的文件，耗时随文件量增长（可能数分钟）。手动添加的内容（kb_add）不受影响。属较重操作，建议先向用户确认。",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "kb_status",
+            "description": "查看知识库状态，返回已索引文本块数量（文件索引 / 手动添加分别统计）。只读，瞬时返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        },
+        {
+            "name": "kb_add",
+            "description": "将文本内容加入长期记忆知识库（可被检索）。当用户说\"录入记忆\"\"记住xxx\"\"保存xxx\"\"把xxx记下来/存起来\"或要求记住信息时使用。写入内容与文件索引分开存储，不受重建索引影响。写入触发 embedding，秒级。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "要加入知识库的文本内容"},
+                    "source": {"type": "string", "description": "来源说明，如 URL 或文件名。默认为“用户提供的资料”"}
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "kb_hybrid",
+            "description": "混合检索：BM25 关键词 + 语义向量双引擎联合搜索。比纯向量搜索更精准，适合同时包含关键词和语义描述的查询。本地检索，秒级返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词或自然语言问题"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "kb_related",
+            "description": "查询文件的依赖关系图谱：该文件依赖了哪些文件、被哪些文件使用。支持 Python import 和 Markdown 链接解析。本地计算，秒级返回。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "要查询的文件路径"},
+                    "depth": {"type": "integer", "description": "遍历深度，默认 2"}
+                },
+                "required": ["file_path"]
+            }
+        },
+        {
+            "name": "kb_mcp",
+            "description": "启动知识库 MCP Server（stdio 协议），供外部 AI 工具（Cursor、Claude Code 等）连接使用。这是对外接口；鲸鱼娘自己检索知识库用 kb_search/kb_hybrid，无需调用本工具。",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    ]
+}
