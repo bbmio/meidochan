@@ -1,0 +1,22 @@
+name: 提个建议
+description: 想要新功能，或觉得哪里可以更好
+title: "[建议] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: 你想要什么
+      description: 一句话说清就行，不用写得很正式
+      placeholder: |
+        希望能给立绘加个「打个哈欠」的动作。
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: 什么场景下会用到
+      description: 说说你的使用场景，方便判断优先级和怎么做更顺手
+    validations:
+      required: false

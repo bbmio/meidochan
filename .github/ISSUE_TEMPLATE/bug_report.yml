@@ -1,0 +1,69 @@
+name: 报告问题
+description: 程序报错、行为不对、卡住或崩了
+title: "[问题] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！把下面几项填全，定位能快很多。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 你说了什么、期望什么、实际发生了什么
+      placeholder: |
+        我说「笑一个」，期望她换表情，但立绘没有反应。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 怎么复现
+      description: 尽量写成一步一步的，能稳定复现最好
+      placeholder: |
+        1. 启动程序
+        2. 在聊天框输入「笑一个」
+        3. 立绘没反应
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 程序里「设置 → 关于」或标题栏能看到
+      placeholder: 妹抖酱 v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: 怎么装的
+      options:
+        - 打包版（下载的 exe）
+        - 源码版（git clone / 解压源码包）
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: |
+        `data/logs/meido.log` 的最后一段 —— 托盘右键 →「查看日志」可以直接打开。
+        报错时的 traceback 也在这里。
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: env
+    attributes:
+      label: 运行环境
+      placeholder: Windows 11 / Python 3.12 / 用的是 DeepSeek 云端
+    validations:
+      required: false

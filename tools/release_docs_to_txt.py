@@ -37,6 +37,7 @@ from typing import List, Tuple
 DOCS: Tuple[str, ...] = (
     "README.md",
     "docs/ARCHITECTURE_V3.md",
+    "docs/DEVELOPMENT.md",
     "docs/TEST_CHECKLIST.md",
     "docs/UPGRADE_PLAN.md",
 )

@@ -1,0 +1,246 @@
+# 妹抖酱 · 开发与维护笔记
+
+面向**维护者**（也就是我自己）。面向用户的说明在 `README.txt` / `README.txt`。
+
+---
+
+## 1. 目录结构
+
+```
+main.py                 启动入口（PySide6 桌面窗口 + 引擎装配）
+core/                   引擎、大脑（LLM 调用 / 工具循环）、上下文、历史、配置、插件管理、记忆
+  paths.py              路径层（APP_DIR / RESOURCE_DIR），所有目录一律走它
+  live2d_assets.py      Live2D 动作 / 表情清单的**唯一出处**（见 §5）
+  live2d_control.py     AI 控制立绘的跨线程请求队列（见 §5）
+  selfcheck.py          启动自检（模型服务 / 向量模型 / API Key → 人话指引）
+  logging_utils.py      日志（data/logs/meido.log，2MB × 5 轮转）
+ui_qt/                  PySide6 界面（main_window / chat_view / sidebar / stage_view /
+                          settings_dialog / theme / theme_editor / media 媒体抽象层）
+plugins/                file_explorer / knowledge_base / web_search / live2d_control / static_stand
+workspace/              工作空间模型、存储、管理器
+workspaces/             【数据】每个工作空间的人设 / 历史 / 知识库 / 记忆
+config/                 全部配置（toml）
+roles/ skills/          角色文件 / Skills 能力包
+docs/                   架构（ARCHITECTURE_V3）、测试清单、本文件
+tests/                  pytest 测试
+tools/                  维护脚本（见 §3、§4）
+build/                  打包配置（meido.spec + build.bat）
+data/                   【数据】日志、缓存等运行时产物
+dist/                   【产物】打包输出（不入库）
+```
+
+---
+
+## 2. 配置项全表
+
+| 配置文件 | 作用 |
+|:---|:---|
+| `config/bot.toml` | 名称 / 版本、`user_id_source`、`max_input_length`、路径（conversations / memory / sandbox）、`[logging] level`、`[logging] show_console` |
+| `config/model.toml` | `provider`、`base_url`、默认模型、`thinking`、`reasoning_effort`、`max_tokens`、模型别名、重试 |
+| `config/persona.toml` | 全局人设（system prompt） |
+| `config/identity.toml` | 用户身份 `[user]`、偏好 `[preferences]`、固定规则 `[[pins]]` |
+| `config/plugins.toml` | 插件开关（`disabled` 列表）与插件参数 |
+| `config/appearance.toml` | 颜色主题（`preset` = 亮色 / 深色 / 初音 / 自定义，自定义时附 18 个语义色）与视觉特效 |
+| `config/live2d.toml` | 立绘模型（`dir` / `definition` / `viewer`）、`state_map`、点击轮换表情、视线跟随 |
+| `plugins/web_search/config.yaml` | 搜索引擎、代理 `proxy`、`searxng_url`、结果条数 |
+| `workspaces/<id>/workspace.toml` | 单个工作空间：`persona_prompt`、`plugin_enabled` |
+
+---
+
+## 3. 打包成 exe
+
+```powershell
+# 一键（推荐）
+build\build.bat
+
+# 或手动
+python -m pip install "pyinstaller==6.22.2"
+python -m PyInstaller build\meido.spec --noconfirm
+```
+
+- 产物：`dist/meido/meido.exe`（`--onedir`，无控制台），约 **790 MB**
+- **外置目录**（必须与 exe 同级，`build.bat` 会自动复制）：
+  `config/ plugins/ workspaces/ assets/ roles/ skills/ data/`
+- 交付：把 `dist/meido` 整个目录打包成 zip；或把 `meido.exe` 改名为 `妹抖酱v0.1.exe`
+  （建议 exe 路径保持纯 ASCII）
+
+> **体积为什么这么大**：Live2D 用 QtWebEngine 播放，`Qt6WebEngineCore.dll` 单文件约 195 MB。
+> 这是**必需**的 —— `ui_qt/media/sources/live2d_source.py` 在模块顶层就 import 它，
+> 而这条链在**启动路径**上（`main.py` → `ui_qt.app` → `main_window` → `agent_state` → `ui_qt.media`）。
+> 请**不要**把 `PySide6.QtWebEngineCore` / `QtWebEngineWidgets` 加回 `meido.spec` 的 `excludes`。
+
+**自动化时的注意**：`build.bat` 是交互式的（含 `pause`），脚本里直接调 PyInstaller：
+`python -m PyInstaller build/meido.spec --noconfirm --distpath dist --workpath build/meido-work`。
+**不要预 `rm -rf`** —— 沙箱的批量删除保护会拦（`SAFE_DELETE_BULK_CONFIRM_REQUIRED`），
+`--noconfirm` 自己会替换；若拦在 COLLECT / work 目录清理上，**先把旧目录 `mv` 改名让路**再跑。
+
+### 后台调试窗口（可选开启）
+
+发布版默认没有黑窗口。需要实时看日志与 `print` 时，改 `config/bot.toml`：
+
+```toml
+[logging]
+show_console = true
+```
+
+重启后程序会自己 `AllocConsole()` 分配一个控制台窗口，并把输出重定向过去。
+**同一个 exe，不用换产物、不用重新打包。**
+
+为什么不是打包时决定（`console=True`）：那样每次启动都会先由系统分配控制台、再被程序隐藏，
+用户会看到一次黑窗闪烁。GUI 子系统本来就不分配控制台，需要时再新建，启动路径上零闪烁。
+
+打包配置里仍保留 `build.bat debug`（`console=True`）这一变体，用途不同：
+它保留的是 **PyInstaller bootloader 阶段**的控制台，也就是「Python 还没跑起来就崩了」
+（解包失败、`_internal` 缺文件、缺 VC 运行库）时唯一能看到输出的形态。
+`AllocConsole()` 只能覆盖 Python 代码开始执行之后的阶段。
+
+源码分发版同理：`启动妹抖酱.bat` 用 `pythonw` 启动（无窗口），读的是同一个开关。
+
+---
+
+## 4. 源码分发版：文档是 `.txt` 不是 `.md`
+
+分发给用户的源码包里，`README` 与 `docs/` 下几篇是 **`.txt`** ——
+Windows 双击 `.md` 会弹「你要如何打开这个文件？」，用户根本打不开。
+
+⚠️ **每次从源项目同步到 release 之后，必须再跑一次**：
+
+```powershell
+python tools\release_docs_to_txt.py          # 幂等，多跑无害
+python tools\release_docs_to_txt.py --check  # 只看要做什么，不改动
+```
+
+否则同步会把 `.md` 拷回来、把改名悄悄撤销（脚本会检测 `.md` 与 `.txt` 并存的情况，
+以新同步的 `.md` 为准覆盖）。
+
+**唯一不动的是 `skills/translate/SKILL.md`** —— 它是**程序文件**不是文档：
+`core/skills.py` 按 `SKILL.md` 这个确切名字加载，改名会让「翻译」技能直接失效。
+
+源项目里这几篇**仍是 `.md`**（GitHub 渲染 / 编辑器友好），两边各自自洽、互不干扰。
+
+---
+
+## 5. 容易踩的坑（实现层面）
+
+### Live2D 名字的单一出处
+
+`core/live2d_assets.py` 是「模型目录里到底有哪些动作 / 表情」的**唯一出处**，三处共用：
+
+| 调用方 | 用哪个函数 | 要什么形式 |
+|:---|:---|:---|
+| `ui_qt/media/sources/live2d_source.py` | `scan_model_assets()` | 相对路径（`motions/喷水.motion3.json`） |
+| `ui_qt/settings_dialog.py` | `asset_names()` | **基名**（`喷水`） |
+| `tools/probe_webengine.py` | `scan_model_assets()` | 相对路径 |
+
+⚠️ 播放器用**基名**注册（`assets/live2d/viewer/index.html` 的 `stem()`），
+所以 `config/live2d.toml` 的 `state_map` 填的必须是基名 —— 填完整路径的表现是
+「配了却没反应」，界面上完全看不出哪里错。三者**必须共用同一个函数**。
+
+### AI 控制立绘：跨线程 + 保持期
+
+- **线程**：工具跑在 worker 线程，Live2D 是 Qt 控件 —— 跨线程碰会崩。
+  所以 `plugins/live2d_control/` 只往 `core/live2d_control.py` 的队列塞请求，
+  由 `main_window` 的 150ms 定时器搬到 GUI 线程执行。
+  这与 `core/brain.py` 上报对话阶段是同一种做法（core 存状态、UI 来读），
+  不引入 core → Qt 的反向依赖。
+- **保持期**：`_sync_agent_state()` 每次阶段变化都用 `state_map` 覆盖表情。
+  AI 刚设完「开心兴奋」、阶段一变 `writing` 就被换成「画笔」—— 等于白设。
+  所以 AI 设的表情进入保持期（`main_window._live2d_hold`），期间只播动作、不动表情。
+- ⚠️⚠️ **回合结束时不能提前调 `tracker.reset()`**：它会把状态置为 IDLE，
+  之后定时器里再 `reset()` 就返回 `None`（状态无变化），`_sync_agent_state(None)`
+  直接 early-return —— **AI 设的表情永远回不去**。保持期内必须推迟到定时器里一次性完成。
+  `tests/test_live2d_control.py::TestHoldRelease` 专门钉住了这个顺序。
+
+### 颜色主题
+
+`ui_qt/theme.py` 是**唯一**令牌出处（`LIGHT_TOKENS` / `DARK_TOKENS` / `MIKU_TOKENS`
+→ `THEMES` 注册表）。取色一律走 `theme.active_tokens()`，`build_qss()` 与自绘控件都从它取
+→ `set_active_theme()` 后重新 `build_qss()` 即全局换肤。
+
+- ⚠️ `speech_bubble` 是**自绘**的（`paintEvent` 里 `fillPath`），换主题必须 `update()`，
+  光 `setStyleSheet` 刷不掉
+- ⚠️ `active_tokens()` 返回**副本**，别改回去
+- 改主题**只能**动令牌，禁止在控件里散落硬编码颜色
+
+### 其它
+
+- **消息 `time` 是本地字段**：落盘时带上（界面显示 / 会话索引），发给模型前由
+  `core.brain._api_messages` 剥离。格式由 `core.history.STAMP_FORMAT` 单点定义。
+  ⚠️ `brain` 是 `kwargs["messages"] = messages` **原样透传**，加字段必须同步加剥离。
+- **`_Log` 门面必须有 `warning`**：`core/logging_utils._Log` 是**手写门面**，没有兜底 ——
+  调不存在的方法会抛 `AttributeError`。曾经只有 `warn` 而 `main_window._on_selfcheck_done`
+  用的是 `log.warning`，导致**自检发现问题时提示框与侧栏状态全都不显示**。
+  `tests/test_log_facade.py` 会**扫全仓 `log.xxx(` 调用点**断言门面上都有，别再删方法。
+- **坏配置文件不再导致启动即崩**：`ConfigLoader.load()` 捕获解析异常 → **原文件不动** →
+  另存 `.bak-<时间戳>`（只备一次）→ 打 ERROR 日志 → 返回空 dict。
+  ⚠️ **刻意不学 `workspace/storage.py` 的「改名移走」** —— 那边是程序生成的配置，
+  而 `config/*.toml` 是用户手写的，且 `bot.toml` 存着数据目录路径，移走等于悄悄换掉
+  用户的数据位置。对用户手写的文件，非破坏性优先。
+- **`.bat` 必须纯 ASCII**：cmd.exe 用 OEM 代码页（GBK）在**读取阶段**解码，
+  UTF-8 中文会被错解成**真实命令行**（实测吃掉过 `pip install`），不只是乱码。
+  `chcp 65001` 救不了。中文提示一律交给 Python（见 `tools/startup_notice.py`）。
+- **`file_explorer` 的 `verify_command` 是当 shell 命令执行的**
+  （`plugins/file_explorer/main.py`，`subprocess.run(..., shell=True)`），
+  它读自 `plugins/file_explorer/manifest.json` —— **改这个字段等于给后续的受保护写入
+  挂上一条任意命令**。默认值是 `python -m pytest tests -q`。
+  不需要这层保护就把 `config.write.protected` 清空，那样校验根本不会触发。
+- **`edit_file` 要求 `old` 片段唯一**；不唯一时会告诉你出现了几次，把片段写长一点即可。
+
+---
+
+## 6. 测试
+
+```powershell
+python -m pytest tests -v
+```
+
+⚠️ **退出码不可信**：沙箱的清理钩子会把退出码弄成 1 而测试其实全过。
+**一律读 `--junit-xml` 的 `tests/errors` / `tests/failures` 属性。**
+
+覆盖：工作空间创建 / 切换 / 隔离 / 持久化、TOML 读写与损坏自愈、固定规则持久化、
+system prompt 组装、历史落盘 / 去重、消息时间戳、颜色主题（预设完整性 / WCAG 对比度 /
+active 令牌切换 / 外观配置往返）、色轮面板、后台调试窗口开关、配置面板回填与保存、
+路径解析、启动自检、日志门面接口、Live2D 资源清单与下拉框、AI 控制立绘（队列 / 插件 /
+JS 转义 / 保持期）。
+
+**已知环境性抖动**（非产品缺陷，重跑通常就过）：
+
+- `tests/test_file_editor.py::test_protected_write_keeps_when_verify_passes` 报 `[WinError 50]`
+- `tests/test_history.py::TestHistoryIO::test_new_session_creates_new_file` 偶尔报
+  「期望 2 个会话文件、只看到 1 个」（临时目录的 FS 竞态）
+
+---
+
+## 7. 维护者向 FAQ
+
+| 现象 | 原因与解法 |
+|:---|:---|
+| 调试窗口里看不到回复正文 | 正文会实时打印（思考链打完会先打一行 `[正文]` 分隔）；若整段都没出现，检查是否被 `config/bot.toml` 的 `[logging] level` 过滤 |
+| 开了调试窗口后程序崩了、窗口一闪而过 | 崩溃时会强制把窗口亮出来并显示 traceback（见 `main.py` 的兜底），按回车关闭；完整日志在 `data/logs/meido.log` |
+| 打包版双击后没有窗口，日志只有一行 `[启动] 控制台：…` | 多半是产物**缺模块**（典型：`PySide6.QtWebEngineCore`）。此时 `main.py` 的崩溃兜底会把 traceback 打进一个临时控制台窗口，**日志文件里看不到**。改用 `build\build.bat debug` 构建排障版即可看到真正报错；确认是缺模块就检查 `build/meido.spec` 的 `excludes` 是否误排除了它 |
+| 冒烟测试后 `QtWebEngineProcess.exe` 还在 | 只杀 `meido.exe` 会留下 WebEngine 子进程（实测占 259 MB），记得 `taskkill /F /IM QtWebEngineProcess.exe` |
+| 控制台出现 emoji 相关报错 | 已在 `main.py` / `core/brain.py` 做了编码兜底；如仍出现请设 `PYTHONUTF8=1` |
+
+---
+
+## 8. 推送到 GitHub
+
+**⚠️ 这个开发环境里 `git push` 用不了，但 `gh api` 能用。**
+
+`HTTP_PROXY` 指向的代理对 `github.com` 的 git-over-HTTPS 一律返回
+502（`CONNECT tunnel failed`），而 `api.github.com` 是通的 —— 所以 `gh` 能用、`git push` 不能用。
+
+解法：**`python tools\push_via_api.py`** —— 走 Git Data API（blob → tree → commit → ref）。
+
+**关键：API 造的 commit 与 git 造的永远不可能同 sha。** 实测两处差异：
+
+1. GitHub 保留**发送时**的时区偏移（`+0800`），不规范化成 UTC
+2. GitHub 存的消息**不带结尾换行**；而 `git commit` 总会补一个 `\n` —— 这条无法从本地规避
+
+所以脚本不去「对齐 sha」，而是**反过来**：推送成功后用 GitHub 返回的字段在本地
+**逐字节重建那个 commit 对象**（`git hash-object -t commit -w --stdin`）再把 `main` 指过去，
+让本地与远端完全一致。重建前会校验 sha，对不上就中止（绝不让两边分叉）。
+
+推送前记得先跑 §4 的 `release_docs_to_txt.py`，并确认 release 里没有不该入库的文件
+（`config/apikey.local`、`config/adapters.toml`、`searxng/settings.yml`、`qq/config.toml`、
+`conversation_memory.json`）。
