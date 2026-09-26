@@ -1405,9 +1405,75 @@ class SettingsDialog(QDialog):
         row.addWidget(data_btn)
         row.addStretch(1)
         layout.addLayout(row)
+
+        # 调试窗口：点一下**立即**分配控制台，不用重启、不改配置。
+        # 发布版默认没有黑窗口（GUI 子系统本来就不分配），需要时再 AllocConsole()，
+        # 启动路径上零闪烁 —— 见 core/console_window.py。
+        console_title = QLabel("调试窗口")
+        console_title.setProperty("class", "section")
+        layout.addWidget(console_title)
+
+        console_row = QHBoxLayout()
+        debug_btn = QPushButton("打开调试窗口")
+        debug_btn.setToolTip("立即分配一个控制台窗口，实时看日志与 print。\n"
+                             "不用重启，也不改任何配置。")
+        debug_btn.clicked.connect(self._open_debug_console)
+        console_row.addWidget(debug_btn)
+        console_row.addStretch(1)
+        layout.addLayout(console_row)
+
+        self.console_status = QLabel("")
+        self.console_status.setProperty("class", "status")
+        self.console_status.setWordWrap(True)
+        layout.addWidget(self.console_status)
+        self._refresh_console_status()
+
         layout.addStretch(1)
 
         self.tabs.addTab(page, "日志")
+
+    def _open_debug_console(self) -> None:
+        """立即分配一个调试控制台（不重启、不改配置）。
+
+        `attach_console()` 是「确保有控制台」：已经有就复用，
+        没有才 `AllocConsole()`。所以重复点不会开出第二个窗口。
+        """
+        try:
+            from core.console_window import attach_console
+        except Exception as exc:
+            QMessageBox.warning(self, "打开调试窗口", f"无法加载控制台模块：{exc}")
+            return
+        ok = attach_console()
+        self._refresh_console_status()
+        if not ok:
+            QMessageBox.warning(
+                self, "打开调试窗口",
+                "分配控制台失败。\n\n"
+                "· 如果程序是从终端启动的，输出本来就在那个终端里，不需要这个开关；\n"
+                "· 非 Windows 平台不支持。\n\n"
+                "日志仍然会写进 data/logs/meido.log。")
+
+    def _refresh_console_status(self) -> None:
+        """刷新「调试窗口」那行状态。
+
+        ⚠️ 不用 `console_window.describe_state()` —— 它的措辞假定「有控制台
+        就等于配置开了 show_console」，那是**启动时**的事实；而这里的按钮
+        能在配置为 false 的情况下把窗口开出来，用它会给出错误结论。
+        """
+        try:
+            from core.console_window import allocated_by_us, console_enabled
+            opened = allocated_by_us()
+            always = console_enabled()
+        except Exception:
+            opened, always = False, False
+
+        state = "已打开" if opened else "未打开"
+        if always:
+            tail = "启动时会自动打开（config/bot.toml 的 [logging] show_console = true）"
+        else:
+            tail = ("启动时不会自动打开 —— 想让每次启动都开，"
+                    "把 config/bot.toml 的 [logging] show_console 改成 true")
+        self.console_status.setText(f"调试窗口：{state}。{tail}")
 
     def _open_log(self) -> None:
         from .main_window import MainWindow   # 延迟导入，避免循环依赖

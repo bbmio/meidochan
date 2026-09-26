@@ -296,3 +296,87 @@ class TestLive2DTab:
         dialog.config_saved.connect(seen.append)
         dialog._save_live2d()
         assert seen == ["live2d"]
+
+
+class TestLogTabConsoleButton:
+    """「日志」页的「打开调试窗口」按钮。
+
+    发布版是 GUI 子系统，双击本来就没有黑窗口（`core/console_window.py` 用
+    `AllocConsole()` 按需新建）。这个按钮让开发者**不用改配置、不用重启**
+    就能把控制台开出来。
+
+    ⚠️ 测试里一律 monkeypatch 掉真正的 `attach_console` ——
+    它会 `AllocConsole()`，在测试进程里真的开一个窗口，既吵又会污染输出。
+    """
+
+    def _patch(self, monkeypatch, ok=True):
+        import core.console_window as cw
+
+        calls = []
+        monkeypatch.setattr(cw, "attach_console",
+                            lambda title="x": (calls.append(title), ok)[1])
+        # 弹窗是模态的，离屏测试里会**永久阻塞**，必须换掉
+        warned = []
+        monkeypatch.setattr("ui_qt.settings_dialog.QMessageBox.warning",
+                            lambda *a, **k: warned.append(a))
+        return calls, warned
+
+    def test_button_exists(self, dialog):
+        from PySide6.QtWidgets import QPushButton
+
+        texts = [b.text() for b in dialog.findChildren(QPushButton)]
+        assert "打开调试窗口" in texts
+
+    def test_click_allocates_console(self, dialog, monkeypatch):
+        calls, _warned = self._patch(monkeypatch, ok=True)
+        dialog._open_debug_console()
+        assert len(calls) == 1
+
+    def test_success_shows_no_dialog(self, dialog, monkeypatch):
+        _calls, warned = self._patch(monkeypatch, ok=True)
+        dialog._open_debug_console()
+        assert warned == []
+
+    def test_failure_warns_but_does_not_crash(self, dialog, monkeypatch):
+        _calls, warned = self._patch(monkeypatch, ok=False)
+        dialog._open_debug_console()          # 不该抛
+        assert len(warned) == 1
+        assert "失败" in warned[0][2]
+
+    def test_status_when_config_off(self, dialog, monkeypatch):
+        monkeypatch.setattr("core.console_window.allocated_by_us", lambda: False)
+        monkeypatch.setattr("core.console_window.console_enabled", lambda: False)
+        dialog._refresh_console_status()
+        text = dialog.console_status.text()
+        assert "未打开" in text
+        assert "show_console" in text          # 要告诉用户怎么改成常开
+
+    def test_status_when_config_on(self, dialog, monkeypatch):
+        monkeypatch.setattr("core.console_window.allocated_by_us", lambda: False)
+        monkeypatch.setattr("core.console_window.console_enabled", lambda: True)
+        dialog._refresh_console_status()
+        assert "自动打开" in dialog.console_status.text()
+
+    def test_status_when_already_open(self, dialog, monkeypatch):
+        monkeypatch.setattr("core.console_window.allocated_by_us", lambda: True)
+        monkeypatch.setattr("core.console_window.console_enabled", lambda: False)
+        dialog._refresh_console_status()
+        text = dialog.console_status.text()
+        assert "已打开" in text
+        # 配置是 false 但窗口开着 —— 措辞不能反过来讲成「启动时会自动打开」
+        assert "不会自动打开" in text
+
+    def test_status_survives_import_failure(self, dialog, monkeypatch):
+        """拿不到控制台模块时不该把设置面板拖崩。"""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "core.console_window":
+                raise ImportError("模拟缺失")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        dialog._refresh_console_status()
+        assert "未打开" in dialog.console_status.text()

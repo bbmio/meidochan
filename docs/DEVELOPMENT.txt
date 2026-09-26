@@ -76,12 +76,20 @@ python -m PyInstaller build\meido.spec --noconfirm
 
 ### 后台调试窗口（可选开启）
 
-发布版默认没有黑窗口。需要实时看日志与 `print` 时，改 `config/bot.toml`：
+发布版默认没有黑窗口。三种开法：
+
+1. **「设置 → 日志 → 打开调试窗口」** —— 点一下**立即**开，不用重启、不改配置。
+   这是给开发者临时看日志用的（`ui_qt/settings_dialog.py` 的 `_open_debug_console`，
+   底层是 `core/console_window.attach_console()`；已有控制台就复用，不会开出第二个）。
+2. 改 `config/bot.toml` 让它**每次启动都开**：
 
 ```toml
 [logging]
 show_console = true
 ```
+
+3. **源码版从终端跑** `python main.py`（不是 `启动妹抖酱.bat`，那个走 `pythonw` 无窗口）——
+   程序**不会**去动你已有的终端，输出直接就在里面。
 
 重启后程序会自己 `AllocConsole()` 分配一个控制台窗口，并把输出重定向过去。
 **同一个 exe，不用换产物、不用重新打包。**
@@ -95,6 +103,11 @@ show_console = true
 `AllocConsole()` 只能覆盖 Python 代码开始执行之后的阶段。
 
 源码分发版同理：`启动妹抖酱.bat` 用 `pythonw` 启动（无窗口），读的是同一个开关。
+
+> ⚠️ 设置界面里那行状态**不要**用 `console_window.describe_state()` ——
+> 它的措辞假定「有控制台就等于配置开了 `show_console`」，那是**启动时**的事实；
+> 而按钮能在配置为 false 的情况下把窗口开出来，用它会给出错误结论。
+> 界面里自己按 `allocated_by_us()` / `console_enabled()` 组词。
 
 ---
 
