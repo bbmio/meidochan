@@ -29,6 +29,7 @@ class _RespondWorker(QThread):
     phase_changed = Signal(str)      # 引擎当前阶段（thinking/tool/found/writing）
     completed = Signal(list)
     failed = Signal(str)
+    usage_changed = Signal(dict)     # 主对话的 token 用量（含 prompt cache 命中数）
 
     def __init__(self, engine, user_msg: str, history: list,
                  api_state: list, parent: QObject | None = None) -> None:
@@ -41,6 +42,9 @@ class _RespondWorker(QThread):
     def run(self) -> None:  # noqa: D401
         try:
             latest = ""
+            # 引擎上还留着**上一轮**的用量，先记下来 —— 否则开局第一轮会把旧值
+            # 当成新数据重发一次（状态栏数字没变，但会闪一下）
+            last_seen = getattr(self._engine, "last_usage", None)
             for _msg, current, api in self._engine.respond(
                     self._user_msg, self._history, self._api_state):
                 self._api_state = api
@@ -52,7 +56,39 @@ class _RespondWorker(QThread):
                 # 阶段单独走一路：UI 的表情直接读它，不再从展示文本反推
                 self.phase_changed.emit(
                     getattr(self._engine, "current_phase", "") or "")
+                # 用量同理：只在真的换了一次新数据时才发（工具循环每轮都会更新）
+                usage = getattr(self._engine, "last_usage", None)
+                if usage is not None and usage is not last_seen:
+                    last_seen = usage
+                    self.usage_changed.emit(usage)
             self.completed.emit(list(self._api_state))
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class _EngineStartThread(QThread):
+    """后台跑 `engine.start()`（插件加载 + 工作空间恢复）。
+
+    实测热缓存约 1.0s、冷缓存约 3.9s。原先它在主线程上同步执行，而那段时间
+    事件循环还没启动 —— 窗口虽然已经画出来了，却完全点不动（Windows 还会把
+    它标记成"无响应"）。放到后台线程后窗口立刻可交互，进度由
+    `MainWindow.begin_startup()` 呈现在侧栏。
+
+    ⚠️ 这里只允许跑**不碰 Qt** 的代码。已确认 `plugins/` 下无任何 Qt 引用；
+    而 `on_engine_ready()`（要建 WebEngine、要动控件）仍由信号回主线程执行。
+    """
+
+    started_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(self, engine, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._engine = engine
+
+    def run(self) -> None:  # noqa: D401
+        try:
+            self._engine.start()
+            self.started_ok.emit()
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -64,6 +100,7 @@ class EngineBridge(QObject):
     phase_changed = Signal(str)
     finished = Signal(list)
     failed = Signal(str)
+    usage_changed = Signal(dict)     # 透传 _RespondWorker 的 token 用量
 
     def __init__(self, engine, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -81,6 +118,7 @@ class EngineBridge(QObject):
         worker.phase_changed.connect(self.phase_changed)
         worker.completed.connect(self.finished)
         worker.failed.connect(self.failed)
+        worker.usage_changed.connect(self.usage_changed)
         worker.finished.connect(self._cleanup)
         self._worker = worker
         worker.start()
@@ -106,6 +144,29 @@ def _describe_engine(engine) -> None:
     current = engine.workspace_mgr.current
     if current is not None:
         log.info("[配置] 当前工作空间: [%s] %s", current.id, current.name)
+
+
+def _on_engine_started(engine, window) -> None:
+    """引擎就绪（已由信号回到主线程）：装配素材、列表与启动自检。"""
+    _describe_engine(engine)
+
+    # 默认模型是本地 Ollama 时，启动即预加载并常驻显存（keep_alive=-1）
+    mc = engine.model_config
+    if mc.provider == "ollama" and engine.brain.current_model:
+        threading.Thread(
+            target=engine.brain.keep_model_loaded,
+            args=(engine.brain.current_model,), daemon=True).start()
+
+    window.end_startup()
+    window.on_engine_ready()
+    window.maybe_onboarding()
+
+
+def _on_engine_start_failed(window, detail: str) -> None:
+    """引擎启动失败：解锁界面并指路日志，不让程序带着半启动状态静默运行。"""
+    log.error("引擎启动失败：\n%s", detail)
+    window.end_startup()
+    window.sidebar.set_status("引擎启动失败，详见日志（托盘 → 查看日志）")
 
 
 def main(argv: List[str] | None = None) -> int:
@@ -148,22 +209,11 @@ def main(argv: List[str] | None = None) -> int:
     window.show()
     app.processEvents()   # 先把窗口画出来，再做耗时的引擎启动
 
-    try:
-        engine.start()
-    except Exception:
-        log.error("引擎启动失败：\n%s", traceback.format_exc())
-        window.sidebar.set_status("引擎启动失败，详见日志（托盘 → 查看日志）")
-        return app.exec()
-
-    _describe_engine(engine)
-
-    # 默认模型是本地 Ollama 时，启动即预加载并常驻显存（keep_alive=-1）
-    mc = engine.model_config
-    if mc.provider == "ollama" and engine.brain.current_model:
-        threading.Thread(
-            target=engine.brain.keep_model_loaded,
-            args=(engine.brain.current_model,), daemon=True).start()
-
-    window.on_engine_ready()
-    window.maybe_onboarding()
+    # 引擎启动走后台线程：窗口一出现就能拖动 / 切主题 / 看设置，
+    # 不再有 1~4 秒的"窗口画出来了但点不动"。starter 挂在 window 下保活。
+    window.begin_startup()
+    starter = _EngineStartThread(engine, window)
+    starter.started_ok.connect(lambda: _on_engine_started(engine, window))
+    starter.failed.connect(lambda detail: _on_engine_start_failed(window, detail))
+    starter.start()
     return app.exec()

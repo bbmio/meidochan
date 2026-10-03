@@ -235,6 +235,29 @@ class TestPluginsTab:
         dialog._save_plugins()
         assert seen == ["plugins"]
 
+    def test_risk_switch_defaults_unchecked(self, dialog):
+        """总开关默认关闭（真实 config/plugins.toml 里 allow_risky_tools = false）。"""
+        assert dialog.allow_risky_check.isChecked() is False
+
+    def test_toggle_only_emits_tool_policy(self, dialog, captured):
+        """只改风险开关：写入配置，但发 tool_policy 而不是 plugins（不重启插件）。"""
+        seen = []
+        dialog.config_saved.connect(seen.append)
+        dialog.allow_risky_check.setChecked(True)
+        dialog._save_plugins()
+        assert captured["plugins"].allow_risky_tools is True
+        assert seen == ["tool_policy"]
+
+    def test_plugin_edits_still_reload(self, dialog, captured):
+        """同时改了插件开关：仍走 plugins → 重建插件。"""
+        seen = []
+        dialog.config_saved.connect(seen.append)
+        target = sorted(dialog.plugin_checks)[0]
+        dialog.plugin_checks[target].setChecked(False)
+        dialog.allow_risky_check.setChecked(True)
+        dialog._save_plugins()
+        assert seen == ["plugins"]
+
 
 class TestLive2DTab:
     def test_backfill_model_section(self, dialog):
@@ -316,8 +339,9 @@ class TestLogTabConsoleButton:
         monkeypatch.setattr(cw, "attach_console",
                             lambda title="x": (calls.append(title), ok)[1])
         # 弹窗是模态的，离屏测试里会**永久阻塞**，必须换掉
+        # （改用主题化弹窗后，补丁目标从 QMessageBox.warning 换成 settings_dialog.warn）
         warned = []
-        monkeypatch.setattr("ui_qt.settings_dialog.QMessageBox.warning",
+        monkeypatch.setattr("ui_qt.settings_dialog.warn",
                             lambda *a, **k: warned.append(a))
         return calls, warned
 

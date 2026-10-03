@@ -86,6 +86,30 @@ TOOL_LIST_TEMPLATE = """
 {tools}
 """
 
+#: 工具调用约定（默认提示词末尾的通用说明）
+TOOL_USAGE_GUIDE = """
+### 工具调用约定
+- 工具名只能来自上面的清单，不要自己发明；参数按说明填全，缺参数会被拒绝。
+- 一次只做一轮工具调用：拿到结果先判断够不够，再决定要不要继续。
+- 工具返回里若带了「可用清单」或纠错提示，按它换一个再试，不要重复同样的调用。
+- 只读工具（搜索 / 读文件 / 查状态 / 查知识库）可以直接调；
+  写入或不可逆操作先说明计划，征得用户同意再执行。
+"""
+
+#: 立绘表情工具名（与 plugins/live2d_control 的 TOOL_SET_EXPRESSION 同一份）
+LIVE2D_SET_EXPRESSION_TOOL = "set_live2d_expression"
+
+#: 立绘表情自主选择规则 —— 只在「本机有模型、工具已暴露」时才追加
+LIVE2D_EXPRESSION_RULE = """
+### 我的立绘表情（每轮都要自己做）
+桌面上的立绘由你控制，**每一轮回复都自己挑一个表情**（调用 `set_live2d_expression`）：
+- 依据是你这一轮的语气和心情（开心 / 害羞 / 认真 / 困惑 / 得意…），不是用户的要求；
+- 名字必须来自工具说明里的表情清单，挑最接近的那个，不要造名字；
+- 一轮只切一次，先切表情再说话；表情会保持到本轮结束，之后自动恢复默认脸；
+- 只有用户明确说「别笑了」「表情收一收」时，才用 `clear_live2d_expression` 清掉；
+- 这和「执行任务时不带口癖」不冲突：立绘只是你的表现，回答内容照旧保持专业。
+"""
+
 # ═══════════════════════════════════════════════════════════
 # 全局记忆库（结构化 JSON，跨工作空间共享）
 # ═══════════════════════════════════════════════════════════
@@ -154,26 +178,41 @@ def clear_global_memory() -> str:
 # 动态工具列表（从插件注册表生成，保证与实际一致）
 # ═══════════════════════════════════════════════════════════
 
-def get_plugin_tool_text(plugin_manager) -> str:
-    """从插件管理器动态生成工具列表（真实能力）"""
-    tools = plugin_manager.get_tool_definitions()
+def _plugin_tools(plugin_manager, allow_risky_tools: bool) -> List[dict]:
+    """取插件工具定义；枚举失败返回空列表（提示词不该因为工具枚举失败而构建不出来）。"""
+    try:
+        return list(plugin_manager.get_tool_definitions(
+            allow_risky_tools=allow_risky_tools) or [])
+    except Exception:
+        return []
+
+
+def _format_tool_list(tools: List[dict]) -> str:
+    """把 OpenAI 工具定义渲染成提示词里的清单。"""
     lines = []
     for t in tools:
-        name = t.get("function", {}).get("name", "")
-        desc = t.get("function", {}).get("description", "").replace("\n", " ")[:120]
+        fn = t.get("function") or {}
+        name = fn.get("name", "")
+        desc = (fn.get("description") or "").replace("\n", " ")[:120]
         if name:
             lines.append(f"- `{name}`：{desc}")
-    if not lines:
-        lines = ["- （当前没有可用的插件工具）"]
-    return "\n".join(lines)
+    return "\n".join(lines) or "- （当前没有可用的插件工具）"
 
 
-def build_self_knowledge_prompt(plugin_manager, memory_summary: str = "") -> str:
+def get_plugin_tool_text(plugin_manager, allow_risky_tools: bool = False) -> str:
+    """从插件管理器动态生成工具列表（真实能力）"""
+    return _format_tool_list(_plugin_tools(plugin_manager, allow_risky_tools))
+
+
+def build_self_knowledge_prompt(plugin_manager, memory_summary: str = "",
+                                allow_risky_tools: bool = False) -> str:
     """
     构建完整的自我认知提示词，注入 system prompt。
     memory_summary: 全局记忆库的内容摘要（读过的文件记忆）
+    allow_risky_tools: 风险工具开关；关闭时高风险工具不进清单（与给模型的实际工具保持一致）
     """
-    tool_text = get_plugin_tool_text(plugin_manager)
+    tools = _plugin_tools(plugin_manager, allow_risky_tools)
+    tool_text = _format_tool_list(tools)
     skills_text = build_skills_prompt(str(app_path("skills")))
 
     parts = [
@@ -181,7 +220,11 @@ def build_self_knowledge_prompt(plugin_manager, memory_summary: str = "") -> str
         PROJECT_MAP.format(project_dir=APP_DIR),
         SELF_CHECK_PROTOCOL,
         TOOL_LIST_TEMPLATE.format(tools=tool_text),
+        TOOL_USAGE_GUIDE,
     ]
+    # 立绘表情规则只在工具真的可用时追加 —— 没有模型时不提，免得她反复调一个不存在的工具
+    if any((t.get("function") or {}).get("name") == LIVE2D_SET_EXPRESSION_TOOL for t in tools):
+        parts.append(LIVE2D_EXPRESSION_RULE)
     if skills_text:
         parts.append(skills_text)
     if memory_summary:

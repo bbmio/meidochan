@@ -164,6 +164,26 @@ python tools\release_docs_to_txt.py --check  # 只看要做什么，不改动
   直接 early-return —— **AI 设的表情永远回不去**。保持期内必须推迟到定时器里一次性完成。
   `tests/test_live2d_control.py::TestHoldRelease` 专门钉住了这个顺序。
 
+### 点击轮换表情 vs 拖动（别退回 `click` 事件）
+
+`assets/live2d/viewer/index.html` 里的表情轮换**不能用 DOM 的 `click` 事件**：
+`click` 只要「按下与抬起落在同一元素」就派发，**与位移无关**。而拖动桌宠时
+`live2d_window.py` 会同步 `move()` 窗口，指针相对窗口的位置几乎不变 ——
+抬起时照样派发 `click`，表现就是「**一拖就换表情**」（2026-10-03 修掉的真缺陷）。
+
+正确做法是自己判定，且有两个硬要求：
+
+1. **必须用屏幕坐标**（`screenX/screenY`）。正因为窗口跟着指针走，
+   `clientX/clientY` 在拖动全程几乎恒定，用它们算位移会得到 **0**，判不出拖动。
+2. **必须用「手势过程中的最大位移」**，而不是起止两点。拖出去再拖回原点时
+   起止位移是 0，只看首尾会把它误判成一次点击。
+
+阈值 `CLICK_SLOP = 3` 与 Qt 侧的 `manhattanLength() > 3` 对齐，
+这样「Qt 认为在拖」和「页面认为在拖」的边界一致。
+
+回归守卫：`node tools/probe_live2d_gesture.js`
+（从页面**抽取真实源码**求值，不复制逻辑；并断言页面里不存在 `click` 监听）。
+
 ### 颜色主题
 
 `ui_qt/theme.py` 是**唯一**令牌出处（`LIGHT_TOKENS` / `DARK_TOKENS` / `MIKU_TOKENS`
@@ -174,6 +194,403 @@ python tools\release_docs_to_txt.py --check  # 只看要做什么，不改动
   光 `setStyleSheet` 刷不掉
 - ⚠️ `active_tokens()` 返回**副本**，别改回去
 - 改主题**只能**动令牌，禁止在控件里散落硬编码颜色
+
+### 请求前缀的缓存约束（改上下文前必读）
+
+Prompt cache 的失效边界在「**第一个被改动的 token**」处 —— 那之后的所有内容都要重算，
+而缓存读取的成本只有首次计算的约 **1/10**。所以请求里的内容必须按「变动频率」排：
+**静态的放前面，动态的放末尾**。
+
+实测的请求前缀构成（本项目，19 个工具）：
+
+| 段 | 字符数 | 性质 |
+|:---|---:|:---|
+| 人设 persona | 533 | 静态 |
+| 自我认知（含工具清单） | 4382 | 半静态（随风险开关变） |
+| `tools` 参数 | 6304 | 半静态 |
+| 概览卡 | ~170 | **动态**（每 4 轮重抽） |
+| 历史检索片段 | 不定 | **动态**（每轮都变） |
+
+因此有两条硬规矩：
+
+1. **动态内容一律作为尾部消息注入，绝不拼进 system prompt。**
+   概览卡原先坐在 system prompt 第 5 个位置（人设之后），它一改就作废其后 10,000+
+   字符 —— 而它自己只有 170 字符。现在它由 `engine._build_profile_context()` 作为
+   尾部消息注入，与历史检索片段同一套做法（`engine.respond()`）。
+   **实测对比**（概览卡变动一次、随机 nonce 强制冷启动）：
+   旧布局可复用 **256** token（4.8%），新布局可复用 **5120** token（96.8%）。
+2. **静态部分的生成顺序必须确定。** 工具定义占 6000+ 字符，
+   所以 `PluginManager.discover_and_load()` 用 `sorted(self.plugin_dir.iterdir())`
+   —— `iterdir()` 的顺序取决于文件系统，加删插件后可能变。
+
+回归守卫：`tests/test_cache_layout.py`。
+
+**观测手段**：`core/brain._log_usage()` 会把每次调用的
+`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 写进日志（`[用量] …命中率=…`）。
+命中率突然掉下来，就是前缀被改动的信号。
+⚠️ 流式响应里 usage **只在最后一个 chunk** 上，而那个 chunk 的 `choices` 是**空的**
+—— 取值必须写在 `if not chunk.choices: continue` **之前**，否则永远拿不到。
+请求侧要带 `stream_options={"include_usage": True}`，不加则完全没有 usage
+（DeepSeek 与 Ollama 的 OpenAI 兼容端点都支持）。
+
+### 工具结果必须跨轮保留
+
+**原先的缺陷**：`brain.chat_stream` 把工具消息追加在 `chat_messages` 上，而那是
+`engine.respond()` 里 `list(api_state)` 的**浅拷贝**（`_ensure_complete_tool_calls()`
+还会再返回一个新列表）。所以 `assistant(带 tool_calls)` 与 `tool` 结果**永远进不了
+`api_state`** —— 它们只活在当轮。
+
+**后果**（实测）：第二轮模型会说「我上下文里没留着之前那次列目录的记录」，
+然后**重新调一次同样的工具**。这正是《AI Agent》第二章警告的失效模式：
+「使用滑动窗口的 Agent 经常陷入循环，反复执行相同的工具调用，
+因为它'忘记了'之前已经获得的结果」。本项目是**一轮就丢**，比滑动窗口更激进。
+当时所有历史会话文件里的 tool 消息数都是 **0**。
+
+**现在的机制**：
+
+```
+brain.chat_stream  ──yield {"type":"tool_messages", "messages":[...]}──▶  engine.respond()
+                                                                          └─▶ api_state.extend(...)
+```
+
+- 上报的是**模型视角**的消息（assistant + tool），**不含**概览卡与历史检索片段
+  —— 那两个是每轮重算的临时注入，写进历史会既污染上下文又白占 token
+- 中断时也会把已拿到的结果带上（yield 放在 for 之后）
+
+⚠️ **持久化之后，消费方必须滤掉工具消息**，否则会被带坏：
+
+- `history.load_recent()` —— 它假设「user 后面紧跟 assistant」。工具消息会打乱配对，
+  配出正文为空的假轮次，污染检索查询。现在先滤成纯文本消息再配对。
+- `chat_view.load_messages()` —— 工具轮次的 assistant 正文为空，不滤就会多一个空气泡。
+
+回归守卫：`tests/test_tool_context.py`。
+
+### ⚠️ 工具调用配对：一个被「跨轮保留」引爆的潜伏 bug
+
+`brain._ensure_complete_tool_calls()` 保证「每个 `assistant(tool_calls)` 后面都跟齐
+它声明的**全部** tool 结果」。OpenAI 兼容接口对这条是硬要求，少一条直接 400：
+
+```
+An assistant message with 'tool_calls' must be followed by tool messages
+responding to each 'tool_call_id'. (insufficient tool messages following tool_calls message)
+```
+
+**旧实现只检查「紧邻的前一条是不是带 tool_calls 的 assistant」**：
+
+```python
+if msg.get("role") == "tool":
+    if i == 0 or messages[i-1].get("role") != "assistant" or not messages[i-1].get("tool_calls"):
+        continue          # ← 第 2 条起全被丢掉
+```
+
+于是一个 assistant 声明了 **2 个以上** tool_calls 时，第 2 条起全被丢掉 ——
+正是上面那个 400。实测：
+
+```
+输入: [..., 'assistant', 'tool', 'tool', 'assistant', 'tool', ...]
+输出: [..., 'assistant', 'tool',        'assistant', 'tool', ...]
+```
+
+**它潜伏很久是因为以前 `api_state` 里根本没有 tool 消息**（工具结果不跨轮保留），
+这条路径碰不到。2026-10-03 让工具结果跨轮保留之后才被引爆 ——
+**18:56 那版打包产物就带着这个 bug**。
+
+**现在的实现**：收集**连续**的 tool 结果（不是只看紧邻那一条），按
+`set(got) == set(want)` 校验；**配不齐时整组一起丢** —— 只丢一半会留下一个更坏的
+中间状态（「有 tool_calls 却没人应答」同样 400）。
+
+⚠️ 排查这类问题的正确姿势：**先把真实会话文件里的消息序列打出来，再逐段喂给 API**。
+我一开始按「中断时会存下半截」去猜，方向完全错了 —— 真实的持久化状态是**完全合法**的，
+问题出在**发送前**的清洗步骤。定位过程：
+
+1. 找到会话文件里最后一条 assistant —— 内容是错误消息，说明失败的是哪个请求
+2. 逐段把真实消息喂给 API → 全部通过 → 排除「持久化状态坏了」
+3. 于是怀疑发送前的加工环节 → `_api_messages`（只剥 `time`，没问题）→
+   `_ensure_complete_tool_calls`（**发现问题**）
+
+### 工具结果落盘（「换位置」而不是「删掉」）
+
+单次读文件可以吐 100,000 字符（`plugins/file_explorer/main.py` 的 `MAX_FULL_CONTENT`），
+一次就吃掉大半个上下文预算。但**直接截断会丢信息** —— 模型后面要用到某个细节时，
+原文已经没了。
+
+所以 `core/tool_outputs.py::page_out()` 做的是「**换位置**」：超过 6,000 字符的结果
+**逐字节落盘**到 `data/tool_outputs/<tool_call_id>-<内容哈希>.txt`，上下文里只放
+路径 + 行数 + **首尾预览**（约 2.5K 字符）。
+
+**为什么是首尾预览**：报错往往在**末尾**（异常栈、退出码、总结行），开头则是
+「这是什么」。两头各给一段、中间省略，比只给开头有用得多。
+
+**为什么文件名带内容哈希**：文件留 7 天、跨会话。万一 `tool_call_id` 被复用而没有
+哈希，旧文件会被覆盖，而**旧消息里记着的那个路径**还在引用它 —— 模型读回来的
+就是张冠李戴的内容。带哈希之后这种覆盖不可能发生，且同样内容重复落盘不会产生垃圾。
+
+**为什么它和「工具结果跨轮保留」是配套的**：不落盘就没法保留（一保留就撑爆），
+落了盘才敢把工具结果一直留着。
+
+⚠️ 三条容易踩的：
+1. **落盘失败必须原样返回** —— 宁可多占一点上下文，也不能把内容弄丢。
+2. **`tool_call_id` 不能直接当文件名** —— 它由服务端生成，但带上 `/` 或 `..` 就是目录穿越。只留保守字符集。
+3. **预览里指路的工具名必须真实存在**。实测踩过：文案一开始写 `read_file`，
+   而本项目实际工具叫 `view`（参数 `lines`）—— 写错等于让模型去调一个不存在的工具。
+   `tests/test_tool_outputs.py` 会拿 `plugins/file_explorer/manifest.json` 校验这一点。
+
+实测：`view core/brain.py`（整文件）44,558 字符 → 预览 2,499 字符（**5.6%**）；
+而 `config/model.toml`（1,073 字符）、`ls`（3,598 字符）原样保留。
+
+回归守卫：`tests/test_tool_outputs.py`。
+
+### 上下文按 token 预算裁剪（别再退回「数条数」）
+
+`brain._trim_messages()` 按 **token 预算**裁，不再数消息条数。单位很关键：
+
+| | 40 条消息 ≈ |
+|:---|:---|
+| 普通聊天 | ~3K token —— 白白丢掉还有大量余量的历史 |
+| 带工具调用 | 可能 80K+ —— 而且**一条用户提问会产生好几条消息**，40 条可能只等于 4~8 轮 |
+
+**触发策略：不到水位一条都不丢。** 每轮都裁等于每轮都破坏 prompt cache
+（失效边界在第一个被改动的 token 处），所以攒到接近上限再批量裁。
+
+**token 估算**（`estimate_tokens()`）的系数是**实测**出来的，不是拍的：
+
+| 内容 | 字符/token |
+|:---|---:|
+| 纯中文 | 1.72 |
+| 纯英文 | 4.92 |
+| 纯代码 | 2.51 |
+
+所以**不能**统一按 `chars/4` 估 —— 那对中文会低估约 2.3 倍。按字符类别分开算，
+在 5 个样本上最大误差 13%；**在真实请求上误差 +0.1%**（估算 5252 vs 实际 5246，
+各组件的误差正好互相抵消）。
+
+**窗口取值是 fail-safe 的**：只对**已知**的大窗口服务商（`deepseek`）给 128K，
+其余（ollama / lmstudio / custom / 未知）一律按 32K 保守值算 ——
+猜大了会超窗报错（硬失败），猜小了只是多裁一点历史（可接受）。
+要做成「每个站点可配」需要给 `ModelConfig` / `ModelSite` 加字段并接上 loader 与设置界面。
+
+工具定义不在 `messages` 里但同属一个前缀，所以调用方要用 `reserved=` 把它占的
+token 留出来（本项目 19 个工具约 2.5K token）。
+
+回归守卫：`tests/test_context_budget.py`。
+
+### 状态栏的缓存命中率
+
+状态栏右侧显示 `缓存 94.8% · 累计 93.7%`：**上一次请求**（最灵敏，前缀一被改动
+数字立刻掉）+ **本次运行累计**（单次抖动不算问题，持续走低才是）。悬停有 token 明细。
+
+数据流与 `current_phase` 完全同一套路（都是「brain 上报事件 → engine 存实例属性 →
+worker 用 `getattr` 读走 → Qt 信号回主线程」）：
+
+```
+brain.chat_stream ──yield {"type":"usage","usage":{...}}──▶ engine.last_usage
+                                                              │
+_RespondWorker.usage_changed ──▶ EngineBridge ──▶ MainWindow._on_usage ──▶ status_cache
+```
+
+⚠️ **只上报主对话这一路**。后台调用（会话摘要 / 概览卡抽取）走 `_generate_text` /
+`quick_chat`，报上来只会把状态栏刷成噪音。
+
+⚠️ **本地模型要显示 `---`，不能显示 0%**。Ollama / LM Studio 不返回
+`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`，此时 `usage_snapshot()`
+给的 hit/miss 是 `None`（**不是 0**）。显示成 0% 会让人以为缓存坏了。
+
+⚠️ **换模型要重新累计** —— 不同模型的缓存行为不可比。
+
+⚠️ **初始不能是空字符串**。空 QLabel 只有 12px 宽，等于不存在 —— 实测用户直接反馈
+「没看到」。现在初始给 `缓存 —` 占位，并在悬停里说明「发出第一条消息后开始统计」。
+完整生命周期：
+
+| 阶段 | 宽度 | 文本 |
+|:---|---:|:---|
+| 启动后（未对话） | 48px | `缓存 —` |
+| 第 1 次请求后 | 228px | `缓存 91.6% · 累计 91.6%` |
+| 切到本地模型 | 72px | `缓存 ---` |
+
+回归守卫：`tests/test_usage_status.py`。
+
+### 打包：两个容易漏的依赖 / 数据
+
+**① `mcp` 必须显式收集。** `plugins/mcp_client` 的
+`from mcp import ClientSession` 写在函数体里（懒加载），静态分析**看不到**。
+`build/meido.spec` 里用 `collect_all("mcp")` 收集，并把 mcp 的懒加载依赖
+（pydantic / anyio / httpx_sse / starlette / uvicorn / jwt / sse_starlette /
+python_multipart 等）显式列进 hiddenimports。
+
+漏了的症状：启动日志（**stdout，不是日志文件**）里一行
+`[mcp_client] server [...] 不可用：缺少 mcp 依赖（pip install mcp）：No module named 'mcp'`，
+所有 MCP server 都用不了。**开发机上通常已经装好了 mcp，所以这个坑只在打包版暴露。**
+
+⚠️ 验证「有没有进包」要查 **`build/meido-work/meido/PYZ-00.toc`**（或
+`Analysis-00.toc`），不要 grep 构建日志 —— 日志里只有 INFO 行、不含模块清单，
+`grep -c` 返回 0 还会把 `&&` 命令链断掉。
+
+**② `assets/live2d/DS鲸鱼娘/授权说明.txt` 要在源码里。**
+打包产物取的是**源码**的 `assets/`，而这个文件原先只存在于
+`Desktop\meidochanv0.1-release\`（README 第 224 行链到它 —— 在源码里是**死链**）。
+现已补进源码，打包产物与 release 都带上。
+
+**③ ⚠️ `build.bat` 会把开发机的运行数据一起发出去。**
+它整个 `xcopy` 了 `data/` 和 `workspaces/`，于是产物里带着：
+
+| 路径 | 内容 |
+|:---|:---|
+| `workspaces/*/history/` | **开发机自己的会话历史**（实测 14 个会话，7.1MB） |
+| `data/audit/file_edits.jsonl` | 开发机的文件编辑审计日志 |
+| `data/settings_preview/*.png` | 开发机的设置界面截图 |
+| `data/mcp_output/` | 开发机的 playwright 抓包 |
+| `data/trusted_paths.json` | 开发机「已信任打开」的文件路径 + SHA256 |
+| `data/desktop_stand.json` | 开发机桌宠状态 |
+
+**发布前必须清掉**（`data/` 下这几个目录删掉即可，应用启动时会自建）。
+`build.bat` 的复制清单目前还没排除它们 —— 见待办。
+
+### ⚠️ 打包版改不了自己的代码（受保护文件的校验必然失败）
+
+`plugins/file_explorer` 对 `protected` 命中的目标（`core/**`、`plugins/**`、`ui_qt/**`…）
+写入后会跑 `verify_command`（默认 `python -m pytest tests -q`），失败即自动回滚。
+
+**打包版里这条命令是必然失败的**，原因有两层：
+
+1. `dist/meido/` 里**没有 `tests/` 目录** → pytest 报
+   `ERROR: file or directory not found: tests`（退出码 **4**）
+2. 那个 `python` 是**系统解释器**，没装本项目的依赖（chromadb / PySide6…）
+
+以前这两种情况都被判成「校验未通过」→ 每次写 `plugins/**` 都被回滚，
+表现成**「打包版改不了自己的代码」**。用户实测踩到：改写成功、diff 正确、备份也生成了，
+但被自检机制自动回滚。
+
+**修法**：让校验结果变成**三态**，并把「环境不具备」和「代码改坏了」分开。
+
+| 状态 | 触发条件 | 行为 |
+|:---|:---|:---|
+| `VERIFY_PASS` | 退出码 0 | 改动保留 |
+| `VERIFY_FAIL` | 其它非零退出码（超时、真失败） | **回滚** |
+| `VERIFY_SKIP` | 没配 `verify_command`；`verify_requires` 里的路径不存在；退出码 **4 / 5** | **不回滚**，报告里注明「已跳过校验」 |
+
+- `manifest.json` 的 `write` 段新增 **`verify_requires`**：显式声明这条命令依赖哪些路径。
+  打包版没有 `tests/` → 判定环境不具备 → 跳过且不回滚；开发环境有 → 照常跑。
+- 退出码 **4**（usage error）/ **5**（没收集到用例）也算环境问题 —— 这是 pytest 的约定，
+  判成失败会把好改动也回滚掉。
+- 退出码判定抽成纯函数 `_classify_verify()`，**可测且不起子进程**（见下）。
+
+⚠️ 注意 `core/**`、`ui_qt/**` 在打包版里是**冻进 exe** 的，改 `dist/meido/core/*.py`
+没有意义；真正会用到这条保护的是 `plugins/**`（外部真实 .py 文件）。
+
+回归守卫：`tests/test_file_editor.py` 的 `TestVerifyEnvironment`。
+
+### 启动方式：exe 无头 / bat 有头
+
+两条路径**只差有没有控制台**，代码层面零分叉：
+
+| 方式 | 控制台 | 怎么做到的 |
+|:---|:---|:---|
+| `dist\meido\meido.exe` | 无 | PyInstaller `console=False`（GUI 子系统，系统不分配控制台） |
+| `启动妹抖酱.bat` | 有，且就是调试窗口 | 在**当前控制台**里直接跑 `python main.py`（不 `start`、不 `pythonw`） |
+| `python main.py`（终端里） | 用用户的终端 | 同上 |
+
+为什么不用 `[logging] show_console = true` 来实现 bat 的有头启动：那是个**全局配置**，
+会把 exe 也变成有控制台。而「在已有控制台里跑」这件事本身就够了 ——
+`core/logging_utils.py` 只要发现存在控制台就挂 `StreamHandler`，
+`core/console_window.py` 也绝不会去隐藏不是它自己分配的控制台。
+
+⚠️ 关掉 bat 的控制台会一并结束进程（进程与终端绑定）。想后台常驻请走托盘退出。
+
+### 主题化弹窗（别用裸 `QMessageBox`）
+
+用 `ui_qt/themed_dialog.py` 的 `ask / confirm / info / warn`，不要直接 `QMessageBox.question(...)`。
+裸 `QMessageBox` 带**系统标题栏**，本项目界面全程无边框自绘，深色主题下那条白标题栏很割裂。
+
+⚠️⚠️ **背景不能用 QSS 画**：那个窗口设了 `WA_TranslucentBackground`
+（它隐含 `WA_NoSystemBackground`），Qt 会因此**跳过 `paintBackground`** ——
+QSS 里写的 `background` 根本不会被绘制。实测整个弹窗区域 alpha=0、完全透明，
+只有文字和按钮看得见。所以背景与圆角由 `ThemedMessageBox.paintEvent` 自绘
+（与 `speech_bubble` 同一套做法），令牌仍取自 `theme.active_tokens()`。
+主窗口是靠子控件 `QWidget#root` 绕开这个坑的，但 `QMessageBox` 的内部布局插不进额外子控件。
+
+`tests/test_themed_dialog.py` 用**像素断言**钉住了这件事（中心 alpha 必须 255、
+角落必须透明），别把它删掉。
+
+### 桌宠回复气泡（`ui_qt/speech_bubble.py`）
+
+立绘头顶那个自绘圆角气泡。两条行为约定：
+
+- **鼠标悬浮时不收**：回复结束后本来 9 秒就收（`HOLD_MS`），读长回复根本来不及。
+  现在 `enterEvent` 停掉倒计时，`leaveEvent` 再给 `LEAVE_GRACE_MS`（1.5 秒）——
+  用的是**短宽限**而不是重新等满 9 秒，因为移开鼠标就意味着「看完了」。
+- **高度封顶**：内容区最高 `MAX_CONTENT_HEIGHT`（280px），超出出滑条，
+  不让气泡一路长下去。标签按**完整内容**撑开，比视口高的部分靠滚动看。
+
+⚠️ **气泡不能加 `WindowTransparentForInput`**（历史上加过）。那个标志让气泡对鼠标
+完全透明，代价是它**收不到任何鼠标事件** —— 滑条拖不动，`enterEvent`/`leaveEvent`
+也永远不触发，上面两条都无从实现。去掉之后点气泡不再穿透到下层窗口，但气泡是摆在
+立绘**上方**的（上方放不下才翻到下方），正常不覆盖立绘，实际影响很小。
+
+⚠️⚠️ **`QScrollArea` 的 viewport 会抹掉父级自绘**。它是个普通 QWidget，默认用窗口
+底色填充自己那块区域 —— 结果就是把气泡 `paintEvent` 画的圆角背景**整块抹掉**
+（实测内容区 alpha=0，只剩文字浮在空中）。`viewport().setAutoFillBackground(False)`、
+`WA_TranslucentBackground`、`WA_NoSystemBackground` **都不管用**，
+只有给 viewport 设透明样式表能压住：
+
+```python
+self.scroll.setStyleSheet(
+    "QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+```
+
+⚠️ **贴底判定必须在改尺寸之前**。内容一变长，滚动条的 range 就变了；改完再判会永远
+是「没贴底」，于是永远不跟随（实测踩过）。贴底本身也要 `QTimer.singleShot(0, ...)`
+延迟一拍，等布局稳定后再设值。
+
+⚠️⚠️ **别在每个分片上 `raise_()`**。流式生成时 `show_text` 每秒被调几十次，
+而 `raise_()` 是 `SetWindowPos(HWND_TOP)` —— 会强制桌面合成器重算 z 序，
+长回复持续几十秒，**立绘（WebEngine）明显掉帧**（用户实测反馈）。现在只在
+「从隐藏变可见」时抬一次；窗口本来就是 `WindowStaysOnTopHint`，不需要反复抬。
+
+同时给流式更新加了**节流**（`MIN_UPDATE_INTERVAL_MS = 100`）：间隔内来的更新只记下
+文本，由定时器补一次。实测 192 次送入 → **11 次真正重排**。最后一段文本一定会落地
+（`hold_then_hide()` 会先 flush），`hideEvent` 里会丢掉攒下的文本
+（否则定时器到点会把气泡**又弹回来**）。
+
+> 排查记录：一开始怀疑是 Python 侧重复计算，量下来**三处刷新 + 文本解析全都 < 1ms**
+> （气泡重排 4000 字符才 0.66ms，334 个分片累计 0.08 秒）—— 所以瓶颈不在 CPU，
+> 而在**原生窗口操作**。这类问题必须往窗口系统那边想。
+
+回归守卫：`tests/test_speech_bubble.py`。
+
+### 应用图标
+
+`assets/app.ico` 由 `tools/make_app_icon.py` 从 `plugins/static_stand/stand.png`
+裁出（以脸为中心的正方形，内嵌 16~256 七档）。换立绘后重跑一次该脚本即可。
+
+- `build/meido.spec` 的 `EXE(icon=...)` 读它；文件缺失只是没有图标，不会让打包失败
+- `ui_qt/main_window.py::_app_icon()` 也优先用它。**不要**退回拿 1100x1800 的全身
+  立绘当图标 —— 缩到托盘 16px 只会是一团糊
+- `.ico` 依赖 Qt 的 `qico` 图像插件；`meido.spec` 已经 `collect_data_files` 了
+  `plugins/imageformats/*`，产物里有 `qico.dll`
+
+### 启动流程与窗口状态
+
+- **`engine.start()` 跑在后台线程**（`ui_qt/app.py::_EngineStartThread`），不是主线程。
+  实测**热缓存 1.0s / 冷缓存 3.9s** —— 原先它同步跑在主线程上，而那段时间事件循环
+  还没启动，窗口虽已画出却完全点不动。现在 `window.show()` 后立刻 `app.exec()`，
+  启动进度由 `MainWindow.begin_startup()` 呈现在侧栏。
+  ⚠️ 这个线程里**只能跑不碰 Qt 的代码**。已确认 `plugins/` 下无任何 Qt 引用；
+  `on_engine_ready()`（要建 WebEngine、要动控件）必须由信号回主线程执行。
+  ⚠️ `_EngineStartThread` 必须挂在 `window` 下保活，否则局部变量被回收后信号断掉。
+- **主窗口位置 / 大小记忆**：落在 `data/window_state.json`
+  （与桌面立绘的 `data/desktop_stand.json` 同目录同风格）。
+  - `moveEvent` / `resizeEvent` → 400ms 去抖落盘；`changeEvent(WindowStateChange)`
+    同时负责同步最大化图标与落盘
+  - ⚠️ 最大化时存的是 `normalGeometry()` 而**不是** `geometry()`（后者等于整块屏幕），
+    否则下次「还原」会变成一个铺满屏幕的窗口
+  - ⚠️ 恢复时必须过 `clamp_to_screen()`：换分辨率 / 拔副屏后旧坐标会整个落在屏外，
+    不夹的话窗口等于「消失」（任务栏也点不到）
+- **生成中不锁输入框**：`ChatView.set_busy()` **不再** `setReadOnly(True)`。
+  发送能力由 `send_btn` 的禁用态 + `submit()` 里的 busy 守卫一起兜住，
+  且被挡时要给反馈（写状态行），不能静默吞掉。
+  `PetInputBar.set_enabled_input()` 同理 —— 保留可编辑，用 placeholder 当反馈位。
+- **`set_startup_lock()` 与 `set_busy()` 不是一回事**：前者只挡发送，
+  **不进入 busy 态**（启动阶段没有可停止的生成，不能把「停止」按钮点亮）。
 
 ### 其它
 

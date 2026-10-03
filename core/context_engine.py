@@ -266,9 +266,17 @@ class ContextEngine:
         """
         构建分层 system prompt：
         1. 基础人设（工作空间覆盖优先）
-        1.5 概览卡（常驻前缀，紧跟人设：称呼/名字、风格、偏好）
         2. Role 追加 prompt
         3. Pins 规则注入
+        4. 概览卡（**刻意排在最后**，见下）
+
+        ⚠️ 概览卡为什么排最后：它随对话演进（每 4 轮重抽一次），而 prompt cache
+        的失效边界就在「第一个被改动的 token」处 —— 放在前面会把它后面的所有内容
+        （角色 / 固定规则 / 自我认知 / 工具定义）一起拖下水。实测这条链路上一万多
+        字符，位置放错一次的代价就是整段重算。
+
+        主链路（`engine._build_system_prompt`）已经把它改成**尾部消息**注入
+        （与历史检索片段同一套做法），这里保留参数只为兼容旧调用。
         """
         parts = []
 
@@ -282,10 +290,6 @@ class ContextEngine:
                 base_prompt = base_prompt.get("text", "")
             if base_prompt:
                 parts.append(base_prompt)
-
-        # 1.5 概览卡（常驻，紧跟人设）
-        if profile_cards:
-            parts.append(f"\n\n[概览卡]\n{profile_cards}")
 
         # 2. Role 追加 prompt
         if self._active_role_prompt:
@@ -302,6 +306,10 @@ class ContextEngine:
                     pin_lines.append(f"- {rule}")
             if pin_lines:
                 parts.append(f"\n\n[固定规则]\n" + "\n".join(pin_lines))
+
+        # 4. 概览卡（动态内容，必须垫底）
+        if profile_cards:
+            parts.append(f"\n\n[概览卡]\n{profile_cards}")
 
         return "".join(parts)
 

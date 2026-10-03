@@ -33,7 +33,10 @@ class PluginManager:
         if not self.plugin_dir.exists():
             print(f" 插件目录 '{self.plugin_dir}' 不存在，跳过。")
             return
-        for subdir in self.plugin_dir.iterdir():
+        # 排序：iterdir() 的顺序取决于文件系统，加删插件后可能变。
+        # 工具定义在请求前缀里占 6000+ 字符，顺序一变整段 prompt cache 就作废
+        # （工具定义的动态排序是典型的缓存杀手，见 docs/DEVELOPMENT.md）。
+        for subdir in sorted(self.plugin_dir.iterdir()):
             if not subdir.is_dir():
                 continue
             manifest_path = subdir / "manifest.json"
@@ -158,8 +161,16 @@ class PluginManager:
                 break
         return None
 
-    def get_tool_definitions(self) -> List[dict]:
-        """获取所有工具的 OpenAI 格式定义"""
+    def get_tool_definitions(self, allow_risky_tools: bool = False) -> List[dict]:
+        """获取所有工具的 OpenAI 格式定义。
+
+        allow_risky_tools=False（默认）时高风险工具不向模型暴露：
+        - manifest 里静态声明 `"risk": "high"` 的工具直接跳过；
+        - 动态工具（如 MCP）交给插件自己的 `is_risky_tool()` 判定。
+        `risk` 是本地字段，永远不进 OpenAI schema。
+
+        这只是「可见性过滤」；执行入口（engine.tool_executor）还会再硬拦一次。
+        """
         tools = []
         # 优先使用 manifest.json 中的 tools 定义
         for name, info in self._plugins.items():
@@ -168,6 +179,8 @@ class PluginManager:
             manifest = info.get("manifest", {})
             if "tools" in manifest:
                 for tool_def in manifest["tools"]:
+                    if not allow_risky_tools and tool_def.get("risk") == "high":
+                        continue
                     tools.append({
                         "type": "function",
                         "function": {
@@ -182,10 +195,17 @@ class PluginManager:
             if mod and hasattr(mod, "get_dynamic_tools"):
                 try:
                     dynamic = mod.get_dynamic_tools()
-                    if dynamic:
-                        tools.extend(dynamic)
                 except Exception as e:
                     print(f" 插件 [{name}] get_dynamic_tools 失败: {e}")
+                    dynamic = None
+                for d in dynamic or []:
+                    fn_name = ""
+                    if isinstance(d, dict):
+                        fn_name = (d.get("function") or {}).get("name") or ""
+                    if (not allow_risky_tools and fn_name
+                            and self._risky_by_plugin(mod, fn_name, {})):
+                        continue
+                    tools.append(d)
         return tools
 
     def get_tool_commands(self) -> Dict[str, tuple]:
@@ -194,6 +214,55 @@ class PluginManager:
         for tool_name, (func, plugin_name) in self._tool_registry.items():
             result[f"/{tool_name}"] = (func, plugin_name)
         return result
+
+    def _risky_by_plugin(self, mod, tool_name: str, arguments: dict) -> bool:
+        """询问插件自己的风险判定；判定异常按风险处理（fail-closed）。"""
+        fn = getattr(mod, "is_risky_tool", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn(tool_name, arguments))
+        except Exception as e:
+            print(f" [{getattr(mod, '__name__', '?')}] is_risky_tool({tool_name}) "
+                  f"判定失败（按风险处理）: {e}")
+            return True
+
+    def _find_tool_owner(self, tool_name: str):
+        """找拥有该工具的插件模块：静态注册表优先，其次按 owns_tool 认领。"""
+        if tool_name in self._tool_registry:
+            _func, plugin_name = self._tool_registry[tool_name]
+            return self._load_module(plugin_name)
+        for name, info in self._plugins.items():
+            if info.get("type") != "tool":
+                continue
+            mod = self._load_module(name)
+            if mod is None or not hasattr(mod, "owns_tool"):
+                continue
+            try:
+                if mod.owns_tool(tool_name):
+                    return mod
+            except Exception:
+                continue
+        return None
+
+    def is_tool_risky(self, tool_name: str, arguments: dict | None = None) -> bool:
+        """工具是否属于「风险工具」（本地判定，不发送给模型）。
+
+        判定顺序：
+        1. manifest 静态声明 risk=high（write_file/edit_file/delete_file、mcp_tool_access…）；
+        2. 找工具所有者，询问插件的 is_risky_tool()（open_path / MCP 受限工具）；
+        3. 判定异常按风险处理（fail-closed）并记录日志。
+        """
+        for info in self._plugins.values():
+            if info.get("type") != "tool":
+                continue
+            for tool_def in (info.get("manifest") or {}).get("tools") or []:
+                if tool_def.get("name") == tool_name and tool_def.get("risk") == "high":
+                    return True
+        owner = self._find_tool_owner(tool_name)
+        if owner is None:
+            return False
+        return self._risky_by_plugin(owner, tool_name, arguments or {})
 
     def execute_tool(self, tool_name: str, arguments: dict) -> str:
         """根据工具名执行插件工具"""

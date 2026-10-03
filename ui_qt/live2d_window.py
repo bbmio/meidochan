@@ -9,6 +9,10 @@
    在 view 上装过滤器抓不到。
 3. **过滤器不消费事件**（返回 False）—— 页面还要用同一批事件做点击反应与视线跟随；
    拖拽与点击的区分交给页面自己按位移阈值判断，两边互不干扰。
+   ⚠️ 页面**必须用屏幕坐标**（`screenX/screenY`）算位移：拖动时窗口跟着指针走，
+   指针相对窗口的位置几乎不变，`clientX/clientY` 全程恒定 —— 用它们算会得到 0 位移，
+   完全判不出拖动。这一点踩过坑：见 `assets/live2d/viewer/index.html` 的 mouseup 处理
+   与 `tools/probe_live2d_gesture.js` 的回归守卫。
 """
 from __future__ import annotations
 
@@ -42,6 +46,11 @@ class Live2DWindow(QWidget):
     EDGE = 8
     MIN_W = 160
     MIN_H = 200
+
+    #: 拖动判定阈值（屏幕坐标的曼哈顿距离，单位 = Qt 逻辑像素 = CSS 像素）。
+    #: ⚠️ 必须与 `assets/live2d/viewer/index.html` 里的 `CLICK_SLOP` 保持一致：
+    #: 两边不一致会出现「Qt 认为在拖、页面认为在点」的空档，那就是一次误触。
+    DRAG_SLOP = 3
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(None)
@@ -222,8 +231,15 @@ class Live2DWindow(QWidget):
             global_pos = event.globalPosition().toPoint()
             if self._drag_from is not None:
                 origin_gp, origin_tl = self._drag_from
-                if (global_pos - origin_gp).manhattanLength() > 3:
+                if not self._dragging:
+                    # 没越过阈值前**不移动窗口**。以前这里是无条件 move()，
+                    # 于是单击时手抖几像素就会把桌宠挪走一点 —— 反复点击轮换表情
+                    # 会让它慢慢漂移。（`_dragging` 原本只写不读，等于没接线。）
+                    if (global_pos - origin_gp).manhattanLength() <= self.DRAG_SLOP:
+                        return False
                     self._dragging = True
+                # origin_tl 是按下时的位置且此后不再更新，所以一旦越过阈值，
+                # 窗口会立刻追上光标 —— 阈值吃掉的那几像素不会变成永久滞后
                 self.move(origin_tl + global_pos - origin_gp)
             else:
                 self._update_cursor(global_pos)

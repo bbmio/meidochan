@@ -9,10 +9,10 @@
 # 在色轮面板里改动任意颜色后，preset 会变成「自定义」，色值写进 [theme.tokens]。
 # 令牌键名与含义见 ui_qt/theme.py 的 TOKEN_LABELS。
 [theme]
-preset = "亮色"
+preset = "初音"
 
 [effects]
 preset = "标准"
-window_opacity = 0.98
+window_opacity = 1.0
 backdrop_blur = 8.0
 stand_depth = 0.0

@@ -488,10 +488,13 @@ class ConfigLoader:
     def get_plugins_config(self) -> PluginsConfig:
         data = self.load("plugins.toml")
         p = data.get("plugins", {})
+        allow = p.get("allow_risky_tools", False)
         return PluginsConfig(
             directory=str(to_app_path(p.get("directory") or "plugins")),
             disabled=p.get("disabled", []),
             per_plugin={k: v for k, v in p.items() if isinstance(v, dict)},
+            # 只认真正的布尔：字符串/数字一律视为关闭（fail-closed）
+            allow_risky_tools=allow if isinstance(allow, bool) else False,
         )
 
     def get_persona_config(self) -> PersonaConfig:
@@ -600,6 +603,7 @@ class ConfigLoader:
         plugins: Dict[str, Any] = {
             "directory": _to_rel_if_inside(config.directory, "plugins"),
             "disabled": list(config.disabled or []),
+            "allow_risky_tools": bool(config.allow_risky_tools),
         }
         for name, params in (config.per_plugin or {}).items():
             if isinstance(params, dict):

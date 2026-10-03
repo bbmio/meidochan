@@ -524,6 +524,7 @@ class ChatView(QWidget):
         self._current: Optional[MessageBubble] = None
         self._pending: Optional[tuple] = None
         self._busy = False
+        self._startup_locked = False
         self._stick_bottom = True
         self._last_flow: Optional[tuple] = None
 
@@ -745,6 +746,10 @@ class ChatView(QWidget):
             content = msg.get("content")
             if role not in ("user", "assistant") or not isinstance(content, str):
                 continue
+            # 工具轮次的 assistant 消息（带 tool_calls、正文为空）不参与回放：
+            # 它只是工具调用的载体，界面上没有可展示的内容，放进去只会多一个空气泡
+            if msg.get("tool_calls") and not content.strip():
+                continue
             reasoning, body = split_reply(content)
             bubble = self.add_message(role, "", msg.get("time", ""))
             bubble.set_content(reasoning, body)
@@ -782,11 +787,27 @@ class ChatView(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self._busy = busy
-        self.send_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
-        self.input.setReadOnly(busy)
+        # 生成中**不锁输入框**：用户仍可以改稿、粘贴下一条。把输入框设成 readOnly
+        # 会让长回复期间完全无法操作，是明显的体验倒退。发送能力由 send_btn 的
+        # 禁用态 + submit() 里的 busy 守卫一起兜住。
+        self._sync_send_enabled()
         if not busy:
             self.input.setFocus()
+
+    def set_startup_lock(self, locked: bool) -> None:
+        """引擎启动期间锁住输入区。
+
+        与 set_busy 的区别：**不进入 busy 态** —— 不会把「停止」按钮点亮
+        （启动阶段没有可停止的生成），只挡住发送。
+        """
+        self._startup_locked = bool(locked)
+        self.input.setEnabled(not locked)
+        self._sync_send_enabled()
+
+    def _sync_send_enabled(self) -> None:
+        """发送按钮的可用性由「是否在生成」与「是否在启动」共同决定。"""
+        self.send_btn.setEnabled(not self._busy and not self._startup_locked)
 
     @property
     def busy(self) -> bool:
@@ -819,7 +840,13 @@ class ChatView(QWidget):
 
     def submit(self) -> None:
         """发送当前输入框内容（快捷键 / 按钮 / 外部调用统一入口）。"""
+        if self._startup_locked:
+            self.set_status("引擎还在启动，请稍候…")
+            return
         if self._busy:
+            # 输入框在生成中仍可编辑，所以这里**必须**给反馈 ——
+            # 否则回车像是没反应，用户会以为程序卡了。
+            self.set_status("正在生成中，等这条回复结束后再发送")
             return
         text = self.input.toPlainText().strip()
         if not text:

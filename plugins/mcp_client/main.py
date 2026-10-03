@@ -346,6 +346,21 @@ def owns_tool(tool_name: str) -> bool:
     return server_name in _SERVERS
 
 
+def is_risky_tool(tool_name: str, arguments: dict) -> bool:
+    """受限工具（server 的 disabled_tools）永远算风险 —— 即使已授权。
+
+    供 PluginManager 在「风险工具开关关闭」时隐藏/拒绝它们；
+    与 mcp_tool_access 的授权记录无关（历史授权不改变风险属性）。
+    """
+    if NAME_SEP not in tool_name:
+        return False
+    server_name, raw = tool_name.split(NAME_SEP, 1)
+    server = _SERVERS.get(server_name)
+    if server is None:
+        return False
+    return raw in _disabled_of(server)
+
+
 def call_dynamic_tool(tool_name: str, arguments: dict) -> str:
     """执行一个动态（MCP）工具。"""
     server_name, raw = tool_name.split(NAME_SEP, 1)

@@ -28,6 +28,7 @@
         },
         {
             "name": "mcp_tool_access",
+            "risk": "high",
             "description": "申请使用被默认禁用的高风险 MCP 工具。不带参数调用可列出可申请的工具；带 tool 与 reason 调用会生成申请文本，需向用户说明并征得同意后，再带 confirm=true 调一次完成授权；带 revoke=true 可撤销授权。授权后下次对话该工具才可用。",
             "parameters": {
                 "type": "object",
