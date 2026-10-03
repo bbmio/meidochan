@@ -1,4 +1,4 @@
-"""启动完成后的中文提示。
+"""启动前的中文提示（由 `启动妹抖酱.bat` 调用）。
 
 ## 为什么单独放一个文件
 
@@ -12,6 +12,16 @@ cmd.exe 用系统 ANSI 代码页（中文 Windows 上是 GBK）解析批处理�
 （配合 bat 的 `chcp 65001`，Python 写 UTF-8 到控制台即可正常显示）。
 
 不要因为「就加一句提示」把中文搬回 bat。
+
+## 这条提示现在讲什么
+
+bat 已经改成**在当前控制台里直接跑 `python main.py`**（有头启动），
+所以这个控制台**就是**实时调试窗口 —— 日志与 print 都会打在这里。
+（`core/logging_utils.py` 只要发现存在控制台就会挂 `StreamHandler`；
+`core/console_window.py` 也绝不会去动不是它自己分配的控制台。）
+
+因此这里不再讲「启动完成」，而是在启动**之前**交代清楚：窗口别关、
+日志在哪、想要无控制台就用打包好的 exe。
 """
 import sys
 from pathlib import Path
@@ -24,22 +34,21 @@ from core.console_window import console_enabled  # noqa: E402
 def main() -> int:
     print()
     print("=" * 60)
-    print("  启动完成！桌面窗口已出现。")
+    print("  即将启动妹抖酱（有头模式）")
     print("=" * 60)
     print()
-    print("提示：桌面窗口会立即出现，但插件 / 工作空间 / 向量模型就绪")
-    print("      需要 10-30 秒，稍等片刻即可开始对话。")
+    print("这个控制台窗口就是实时调试窗口 —— 日志与 print 都打在这里。")
+    print("启动期间窗口会先出现，插件 / 工作空间 / 向量模型就绪还需几秒。")
+    print()
+    print("⚠️ 关闭这个窗口会一并结束妹抖酱。想让它后台常驻，请用托盘")
+    print("   右键 →「退出」，或者直接双击打包好的 exe（无控制台）。")
     print()
 
     if console_enabled():
-        print("后台调试窗口：已开启（config/bot.toml 的 show_console = true）")
-        print("              会另开一个控制台窗口，实时显示日志与 print。")
-    else:
-        print("后台调试窗口：已关闭（默认）。需要实时看日志时，")
-        print("              把 config/bot.toml 的 [logging] show_console 改成 true")
-        print("              再重新启动即可，无需换 exe 或重新安装。")
+        print("另外：config/bot.toml 的 show_console = true，所以程序还会")
+        print("      再分配一个控制台。两者内容相同，关掉一个不影响运行。")
+        print()
 
-    print()
     print("日志文件：data/logs/meido.log")
     print("          托盘右键 →「查看日志」也可直接打开。")
     print()

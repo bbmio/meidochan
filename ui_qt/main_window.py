@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QPoint, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -57,7 +57,51 @@ from .speech_bubble import SpeechBubble, bubble_style
 from .settings_dialog import OnboardingDialog, SettingsDialog
 from .sidebar import Sidebar
 from .stage_view import StagePanel, StageView
+from .themed_dialog import Choice, ThemedMessageBox, ask, info
 from .theme import APPEARANCE_PRESETS, STAGE_WIDTH, TITLEBAR_HEIGHT, WINDOW_MARGIN
+
+#: 主窗口位置 / 大小 / 最大化状态的落盘文件名。
+#: 放在 data/ 下，与桌面立绘的 desktop_stand.json 同一目录、同一种做法 ——
+#: 同一个应用里两套窗口状态标准会让人困惑。
+WINDOW_STATE_FILE = "window_state.json"
+
+
+def _window_state_path() -> Path:
+    return app_path("data", WINDOW_STATE_FILE)
+
+
+def clamp_to_screen(x: int, y: int, w: int, h: int, areas=None) -> tuple:
+    """把窗口左上角夹回某块屏幕的可用区内，返回 (x, y)。
+
+    换分辨率、拔掉副屏、改缩放后，上次存下的坐标可能整个落在屏幕外 ——
+    不夹的话窗口会「消失」（实际在屏幕外，任务栏也点不到）。
+
+    抽成纯函数是为了能测：多屏环境不好造，用合成坐标就能覆盖。
+    """
+    if areas is None:
+        areas = [s.availableGeometry() for s in QApplication.screens()]
+    if not areas:
+        return x, y
+    target = None
+    for area in areas:
+        if area.contains(QPoint(x, y)):
+            target = area
+            break
+    if target is None:
+        # 没有屏幕包含它 → 取离得最近的一块（比固定用主屏更符合直觉）
+        best = None
+        best_dist = None
+        for area in areas:
+            dx = max(area.left() - x, 0, x - area.right())
+            dy = max(area.top() - y, 0, y - area.bottom())
+            dist = dx * dx + dy * dy
+            if best_dist is None or dist < best_dist:
+                best, best_dist = area, dist
+        target = best
+    if target is None:
+        return x, y
+    return (max(target.left(), min(x, target.right() - w + 1)),
+            max(target.top(), min(y, target.bottom() - h + 1)))
 
 
 def _load_live2d_config(engine=None) -> dict:
@@ -188,6 +232,14 @@ class MainWindow(QWidget):
         self.setMouseTracking(True)
         self.setMinimumSize(980, 640)
         self.resize(1280, 800)
+        # 位置 / 大小记忆：拖动与缩放是**连续**事件，逐次写盘会把磁盘敲烂，
+        # 所以统一走这个去抖计时器（停手 400ms 后才落盘）。
+        # 必须在 _restore_window_state() 之前建好 —— 它会触发 resizeEvent。
+        self._state_save_timer = QTimer(self)
+        self._state_save_timer.setSingleShot(True)
+        self._state_save_timer.setInterval(400)
+        self._state_save_timer.timeout.connect(self._save_window_state)
+        self._restore_window_state()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(WINDOW_MARGIN, WINDOW_MARGIN, WINDOW_MARGIN, WINDOW_MARGIN)
@@ -227,11 +279,24 @@ class MainWindow(QWidget):
         self.status_bar = QStatusBar()
         self.status_model = QLabel("")
         self.status_conn = QLabel("")
+        # 初始就给个占位：空 QLabel 只有 12px 宽，等于不存在，用户根本找不到这一栏
+        self.status_cache = QLabel("缓存 —")
+        self.status_cache.setToolTip(
+            "prompt cache 命中率。发出第一条消息后开始统计 ——\n"
+            "上一次请求 + 本次运行累计，鼠标悬停可看 token 明细。")
         self.status_version = QLabel(f"{APP_NAME} {APP_VERSION}")
         self.status_bar.addWidget(self.status_model, 1)
+        self.status_bar.addPermanentWidget(self.status_cache)
         self.status_bar.addPermanentWidget(self.status_conn)
         self.status_bar.addPermanentWidget(self.status_version)
         inner.addWidget(self.status_bar)
+
+        # prompt cache 命中率的累计值（本次运行、当前模型）。命中率突然掉下来
+        # 就是「请求前缀被改动」的信号 —— 见 docs/DEVELOPMENT.md 的缓存约束一节。
+        self._cache_hit_total = 0
+        self._cache_miss_total = 0
+        self._cache_model = ""          # 换模型就重新累计
+        self._cache_unsupported = False  # 该服务商不返回缓存字段（本地模型）
 
         self._wire()
         self._setup_tray()
@@ -283,6 +348,7 @@ class MainWindow(QWidget):
         self.pin_btn.toggled.connect(self._on_pin_toggled)
         layout.addWidget(self.pin_btn)
 
+        window_buttons = []
         for text, slot, name in (
             ("─", self.showMinimized, "winbtn"),
             ("▢", self.toggle_maximize, "winbtn"),
@@ -293,6 +359,11 @@ class MainWindow(QWidget):
             btn.setFixedWidth(38)
             btn.clicked.connect(lambda _=False, s=slot: s())
             layout.addWidget(btn)
+            window_buttons.append(btn)
+        # 留住最大化按钮：它的图标要随窗口状态在 ▢ / ⧉ 之间切换，
+        # 写死图标的话最大化之后仍然显示 ▢，用户看不出当前处于哪个状态。
+        self._min_btn, self._max_btn, self._close_btn = window_buttons
+        self._sync_maximize_button()
 
         self.settings_btn = settings_btn
         return bar
@@ -327,6 +398,7 @@ class MainWindow(QWidget):
         self.bridge.phase_changed.connect(self._on_phase)
         self.bridge.finished.connect(self._on_response_finished)
         self.bridge.failed.connect(self._on_response_failed)
+        self.bridge.usage_changed.connect(self._on_usage)
 
         # Ctrl+Enter 由聊天输入框自身处理（避免与全局快捷键重复触发一次发送）
         QShortcut(QKeySequence("Ctrl+,"), self, self.open_settings)
@@ -663,6 +735,18 @@ class MainWindow(QWidget):
 
     # ── 引擎就绪 ──
 
+    def begin_startup(self) -> None:
+        """引擎在后台启动期间：给出可读进度，别让用户对着一个点不动的窗口。
+
+        实测 `engine.start()` 热缓存约 1.0s、冷缓存约 3.9s —— 期间插件尚未加载，
+        发送必然失败，所以先锁住输入区。
+        """
+        self.sidebar.set_status("正在启动：加载插件与工作空间…")
+        self.chat.set_startup_lock(True)
+
+    def end_startup(self) -> None:
+        self.chat.set_startup_lock(False)
+
     def on_engine_ready(self) -> None:
         """引擎启动完成后再装配素材与列表（插件此时才加载完毕）。"""
         self._load_assets()
@@ -734,8 +818,10 @@ class MainWindow(QWidget):
             self._syncing_ws = False
 
     def refresh_sessions(self) -> None:
+        current = self.engine.history.current_file
         self.sidebar.set_sessions(self.engine.history.list_sessions(),
-                                  self.engine.history.max_sessions)
+                                  self.engine.history.max_sessions,
+                                  getattr(current, "name", ""))
 
     def refresh_roles(self, current_file: str = "") -> None:
         self.sidebar.set_roles(self.engine.context_engine.list_roles(), current_file)
@@ -758,7 +844,7 @@ class MainWindow(QWidget):
         self.sidebar.set_status("启动自检发现 %d 个问题，详见弹出提示或托盘「查看日志」"
                                 % len(problems))
         # 非模态提示：不阻塞启动（用户可以直接去改配置，改完重启即可）
-        box = QMessageBox(self)
+        box = ThemedMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle("启动自检")
         box.setText(report)
@@ -771,10 +857,9 @@ class MainWindow(QWidget):
         """用系统默认程序打开日志文件（不存在时给出可读提示）。"""
         path = log_file()
         if not path.exists():
-            QMessageBox.information(
-                self, "日志",
-                f"日志文件尚未生成：\n{path}\n\n"
-                "程序运行过程中的信息会持续写入该文件（data/logs/）。")
+            info(self, "日志",
+                 f"日志文件尚未生成：\n{path}\n\n"
+                 "程序运行过程中的信息会持续写入该文件（data/logs/）。")
             return
         self.open_path(path)
 
@@ -838,6 +923,18 @@ class MainWindow(QWidget):
 
     # ── 工作空间 ──
 
+    def _guard_busy(self) -> bool:
+        """生成期间禁止重绑定上下文（工作空间 / 会话）。
+
+        正在生成的回复结束时会保存历史、调度概览卡抽取、写向量库 ——
+        中途换了工作空间或会话，这些副作用会写到错误的目标上。
+        返回 True = 可以继续；False = 已提示并中止本次操作。
+        """
+        if self.bridge.busy():
+            self.sidebar.set_status("当前回复仍在生成，请先停止回复后再切换工作空间或会话。")
+            return False
+        return True
+
     def _on_topbar_ws_changed(self, _index: int) -> None:
         if self._syncing_ws:
             return
@@ -849,7 +946,16 @@ class MainWindow(QWidget):
         self._switch_workspace(ws_id)
 
     def _switch_workspace(self, ws_id: str) -> None:
+        if not self._guard_busy():
+            self.refresh_workspaces()      # 把下拉拉回当前空间（_syncing_ws 防重入）
+            return
         result = self.engine.switch_workspace(ws_id)
+        current = self.engine.workspace_mgr.current
+        if current is None or current.id != ws_id:
+            # 引擎拒绝了切换（概览卡保存失败 / 空间不存在）：保持界面原样，只提示
+            self.refresh_workspaces()
+            self.sidebar.set_status(result)
+            return
         self.api_state = []
         self.chat.clear()
         self.refresh_workspaces()
@@ -858,6 +964,8 @@ class MainWindow(QWidget):
         self.status_model.setText(f"模型：{self.engine.brain.current_model}")
 
     def _on_workspace_create(self, name: str) -> None:
+        if not self._guard_busy():
+            return
         message = self.engine.create_workspace(name)
         current = self.engine.workspace_mgr.current
         if current is not None:
@@ -869,6 +977,8 @@ class MainWindow(QWidget):
         self.sidebar.set_status(message)
 
     def _on_workspace_delete(self) -> None:
+        if not self._guard_busy():
+            return
         current = self.engine.workspace_mgr.current
         if current is None:
             self.sidebar.set_status("无工作空间")
@@ -880,7 +990,13 @@ class MainWindow(QWidget):
         name = current.name
         # 当前空间不能直接删：先切到另一个（优先 default）
         target = next((w for w in others if w.id == "default"), others[0])
-        self.engine.switch_workspace(target.id)
+        result = self.engine.switch_workspace(target.id)
+        after = self.engine.workspace_mgr.current
+        if after is None or after.id != target.id:
+            # 切换被拒（如概览卡保存失败）：绝不能继续删旧空间，保持界面原样
+            self.refresh_workspaces()
+            self.sidebar.set_status(result)
+            return
         self.engine.delete_workspace(current.id)
         self.api_state = []
         self.chat.clear()
@@ -891,6 +1007,8 @@ class MainWindow(QWidget):
     # ── 会话 ──
 
     def _on_session_open(self, file_name: str) -> None:
+        if not self._guard_busy():
+            return
         if not file_name:
             return
         self.engine.history.switch_to_session(file_name)
@@ -898,6 +1016,8 @@ class MainWindow(QWidget):
         self.api_state = list(api_state)
         messages = self.engine.history.get_messages() or []
         self.chat.load_messages(messages)
+        # 列表要重画一次：否则「当前会话」高亮还停在上一条上
+        self.refresh_sessions()
         self.sidebar.set_status(f"已切换到会话 {file_name}")
 
     def _on_session_delete(self, file_name: str) -> None:
@@ -928,6 +1048,8 @@ class MainWindow(QWidget):
             log.debug("清理空会话失败：%s", exc)
 
     def _on_new_session(self) -> None:
+        if not self._guard_busy():
+            return
         # 当前会话还是空的就先删掉，避免连点「新会话」堆出一串空会话
         try:
             if self.engine.history.count_messages() == 0:
@@ -936,7 +1058,7 @@ class MainWindow(QWidget):
             log.debug("清理空的新会话失败：%s", exc)
 
         result = self.engine.new_session()
-        if "上限" in result or "无法开启" in result:
+        if "上限" in result or "无法开启" in result or "未创建" in result:
             self.sidebar.set_status(result)
             return
         self.api_state = []
@@ -1177,6 +1299,9 @@ class MainWindow(QWidget):
         elif section == "plugins":
             self.engine.reload_plugins()
             self.sidebar.set_status("插件已按新开关重新加载")
+        elif section == "tool_policy":
+            # 只改了风险工具开关：不重建插件（MCP 子进程不动），下一次调用实时生效
+            self.sidebar.set_status("风险工具开关已保存并生效")
         elif section == "live2d":
             self._reload_live2d_stand()
 
@@ -1267,6 +1392,56 @@ class MainWindow(QWidget):
         self.bridge.send(text, list(self.api_state), list(self.api_state))
         self.sidebar.set_status("正在重新生成…")
 
+    # ── 状态栏：prompt cache 命中率 ──
+
+    @staticmethod
+    def _rate(hit: int, miss: int) -> str:
+        total = hit + miss
+        return f"{hit / total * 100:.1f}%" if total else "—"
+
+    def _on_usage(self, usage: dict) -> None:
+        """更新状态栏的缓存命中率（上一次请求 + 本次运行累计）。
+
+        ⚠️ 本地模型（Ollama / LM Studio）不返回 `prompt_cache_hit_tokens` /
+        `prompt_cache_miss_tokens` —— 此时**不能**显示成 0%（那会让人以为缓存坏了），
+        而是显示 `---` 并注明原因。
+        """
+        hit = usage.get("hit")
+        miss = usage.get("miss")
+
+        if hit is None and miss is None:
+            self._cache_unsupported = True
+            self.status_cache.setText("缓存 ---")
+            self.status_cache.setToolTip(
+                "该服务商未返回缓存字段，无法统计 prompt cache 命中率。\n"
+                "本地模型（Ollama / LM Studio）与部分 API 都不提供；\n"
+                "DeepSeek 等云端服务商会返回 prompt_cache_hit_tokens。")
+            return
+
+        self._cache_unsupported = False
+        hit, miss = int(hit or 0), int(miss or 0)
+
+        # 换模型就重新累计：不同模型的缓存行为不可比
+        model = getattr(self.engine.brain, "current_model", "")
+        if model != self._cache_model:
+            self._cache_model = model
+            self._cache_hit_total = 0
+            self._cache_miss_total = 0
+
+        self._cache_hit_total += hit
+        self._cache_miss_total += miss
+
+        last_rate = self._rate(hit, miss)
+        total_rate = self._rate(self._cache_hit_total, self._cache_miss_total)
+        self.status_cache.setText(f"缓存 {last_rate} · 累计 {total_rate}")
+        self.status_cache.setToolTip(
+            "prompt cache 命中率（缓存读取的成本约为首次计算的 1/10）\n"
+            f"上一次请求：{last_rate}（命中 {hit} / 未命中 {miss} token）\n"
+            f"本次运行累计：{total_rate}"
+            f"（命中 {self._cache_hit_total} / 未命中 {self._cache_miss_total} token）\n"
+            f"模型：{model or '未知'}\n"
+            "命中率突然掉下来 = 请求前缀被改动了")
+
     def _on_response_finished(self, api_state: list) -> None:
         self.api_state = list(api_state or [])
         self.chat.end_response()
@@ -1307,6 +1482,81 @@ class MainWindow(QWidget):
         else:
             self.showMaximized()
 
+    # ── 窗口位置 / 大小记忆 ──
+
+    def _sync_maximize_button(self) -> None:
+        """最大化 / 还原时同步按钮图标与提示。"""
+        btn = getattr(self, "_max_btn", None)
+        if btn is None:
+            return
+        if self.isMaximized():
+            btn.setText("⧉")
+            btn.setToolTip("还原窗口")
+        else:
+            btn.setText("▢")
+            btn.setToolTip("最大化窗口")
+
+    def _restore_window_state(self) -> None:
+        """按上次的几何恢复窗口；坐标越界（换分辨率 / 拔副屏）时夹回屏内。
+
+        读不到或解析失败就用默认的 1280×800 居中 —— 窗口状态坏了不该让程序起不来。
+        """
+        try:
+            data = json.loads(_window_state_path().read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        w, h = data.get("w"), data.get("h")
+        if isinstance(w, int) and isinstance(h, int):
+            self.resize(max(self.minimumWidth(), w), max(self.minimumHeight(), h))
+        x, y = data.get("x"), data.get("y")
+        if isinstance(x, int) and isinstance(y, int):
+            x, y = clamp_to_screen(x, y, self.width(), self.height())
+            self.move(x, y)
+        if data.get("maximized"):
+            self.showMaximized()
+
+    def _touch_window_state(self) -> None:
+        """几何有变化 → 重置去抖计时器（拖动中每帧都发事件，不能逐次写盘）。"""
+        timer = getattr(self, "_state_save_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _save_window_state(self) -> None:
+        """落盘当前几何。
+
+        ⚠️ 最大化时存的是 `normalGeometry()`（还原后的矩形）而不是 `geometry()`
+        （等于整块屏幕）—— 否则下次「还原」会变成一个铺满屏幕的窗口。
+        """
+        try:
+            path = _window_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            maximized = self.isMaximized()
+            rect = self.normalGeometry() if maximized else self.geometry()
+            path.write_text(json.dumps(
+                {"x": rect.x(), "y": rect.y(),
+                 "w": rect.width(), "h": rect.height(),
+                 "maximized": maximized}, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            log.debug("窗口状态保存失败：%s", exc)
+
+    def moveEvent(self, event):  # noqa: N802
+        super().moveEvent(event)
+        self._touch_window_state()
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._touch_window_state()
+
+    def changeEvent(self, event):  # noqa: N802
+        super().changeEvent(event)
+        # 双击标题栏 / 系统快捷键 / 程序调用都会走到这里，
+        # 所以图标同步与状态落盘都挂在这个事件上，不散落在各调用点。
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._sync_maximize_button()
+            self._touch_window_state()
+
     def _on_pin_toggled(self, checked: bool) -> None:
         flags = self.windowFlags()
         if checked:
@@ -1329,14 +1579,44 @@ class MainWindow(QWidget):
         self._force_quit = True
         self.close()
 
+    #: 关闭确认框的三个选项。放在类上是为了让测试能直接引用，不必复制文案。
+    CLOSE_CHOICES = (
+        Choice("tray", "最小化到托盘", primary=True),
+        Choice("quit", "直接退出", danger=True),
+        Choice("cancel", "取消", role=QMessageBox.ButtonRole.RejectRole),
+    )
+
+    def _ask_close_action(self) -> Optional[str]:
+        """✕ 到底做什么，交给用户决定。
+
+        以前是「直接最小化到托盘 + 一个托盘气泡」，想真退出还得再去托盘菜单里找
+        一圈；现在三个选项直接摆出来。直接关掉对话框（或按 Esc）一律当作取消，
+        窗口保持原样 —— 不能把「关掉了弹窗」当成「同意退出」。
+        """
+        return ask(self, "关闭妹抖酱", "要最小化到托盘，还是直接退出？",
+                   list(self.CLOSE_CHOICES),
+                   informative="最小化后可从托盘图标恢复；直接退出会结束进程。",
+                   default="tray")
+
     def closeEvent(self, event):  # noqa: N802
-        # 有托盘时 ✕ = 最小化到托盘（托盘菜单「退出」才真正结束进程）
+        # 去抖计时器可能还挂着未落盘的几何，这里补一次，免得「关掉就丢位置」
+        self._save_window_state()
+        # 有托盘时 ✕ 先问一句；托盘不可用时没有「最小化」这个选项，直接退
         if self.tray is not None and not self._force_quit:
-            event.ignore()
-            self.hide()
-            self.tray.showMessage(APP_DISPLAY, "已最小化到托盘，点击托盘图标可恢复。",
-                                  QSystemTrayIcon.MessageIcon.Information, 2500)
-            return
+            action = self._ask_close_action()
+            if action == "tray":
+                event.ignore()
+                self.hide()
+                self.tray.showMessage(
+                    APP_DISPLAY, "已最小化到托盘，点击托盘图标可恢复。",
+                    QSystemTrayIcon.MessageIcon.Information, 2500)
+                return
+            if action != "quit":
+                # 取消 / 直接关掉对话框 → 什么都不做
+                event.ignore()
+                return
+            # 选了「直接退出」→ 设上标志后落到下面的清理逻辑，不递归调 close()
+            self._force_quit = True
         # 独立立绘与配套对话框是 Tool 窗口，不随主窗口自动关闭，退出时要一并收掉
         if self._desktop_chat is not None:
             self._desktop_chat.close()
@@ -1349,7 +1629,8 @@ class MainWindow(QWidget):
             self._stand_window = None
         try:
             from core.memory import profile_cards
-            profile_cards.flush_to_disk()
+            if not profile_cards.flush_to_disk():
+                log.warning("退出时概览卡保存失败，未落盘的记忆可能丢失")
         except Exception:
             pass
         try:
@@ -1412,14 +1693,31 @@ class MainWindow(QWidget):
 
     def keyPressEvent(self, event):  # noqa: N802
         if event.key() == Qt.Key.Key_Escape:
-            self._on_stop()
-            event.accept()
-            return
+            # Esc 的语义是「停止生成」。没在生成时它不该有任何副作用 ——
+            # 以前无条件调 _on_stop()，空闲时按一下也会提示「已请求停止生成」，
+            # 属于噪音（而且会覆盖侧栏上真正有用的状态文案）。
+            if self.bridge.busy():
+                self._on_stop()
+                event.accept()
+                return
         super().keyPressEvent(event)
 
 
 def _app_icon() -> QIcon:
-    """托盘 / 窗口图标：优先用立绘，缺失时程序绘制一个占位图标。"""
+    """托盘 / 窗口图标。
+
+    优先用 `assets/app.ico` —— 它是从立绘裁出来的**正方形图标**，内嵌多档尺寸，
+    缩到 16px 也认得出是谁。直接拿 1100x1800 的全身立绘当图标，托盘里只会是
+    一团糊（那正是这个函数原来的做法）。
+
+    `assets/app.ico` 由 `tools/make_app_icon.py` 生成；缺失时逐级回退：
+    立绘 → 程序绘制的占位圆。
+    """
+    icon_file = app_path("assets", "app.ico")
+    if icon_file.exists():
+        icon = QIcon(str(icon_file))
+        if not icon.isNull():
+            return icon
     stand = app_path("plugins", "static_stand", "stand.png")
     if stand.exists():
         pixmap = QPixmap(str(stand))

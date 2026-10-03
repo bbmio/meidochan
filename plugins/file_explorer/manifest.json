@@ -39,6 +39,9 @@
                 "memory.py"
             ],
             "verify_command": "python -m pytest tests -q",
+            "verify_requires": [
+                "tests"
+            ],
             "verify_timeout": 180
         },
 
@@ -69,6 +72,8 @@
     "# 2) 覆盖已存在文件前一律先备份到 .meido_backups/（最多保留 max_backups 份）": "",
     "# 3) 命中 protected 的目标=妹抖酱自身代码：写入后自动跑 verify_command，": "",
     "#    失败则自动回滚到备份（先备份，测试不坏才落定）": "",
+    "#    ⚠️ verify_requires 声明这条命令依赖哪些路径：缺了就视为「校验环境不具备」，": "",
+    "#       跳过校验且**不回滚**（打包版没有 tests/，否则每次改 plugins/** 都会被回滚）": "",
     "# 4) require_confirm=true 时进入两段式：先给 diff 预览，需再次调用并带 confirm=true 才写入": "",
     "# 5) 每次写入都记审计日志 data/audit/file_edits.jsonl": "",
 
@@ -115,6 +120,7 @@
         },
         {
             "name": "write_file",
+            "risk": "high",
             "description": "写入（新建或整体覆盖）一个文本文件。会自动创建缺失的父目录、写前自动备份、返回 unified diff。仅用于文本文件，且路径必须在白名单内。改动妹抖酱自身代码时会自动跑测试校验，失败即回滚。",
             "parameters": {
                 "type": "object",
@@ -128,6 +134,7 @@
         },
         {
             "name": "edit_file",
+            "risk": "high",
             "description": "按精确片段修改文本文件：把 old 替换成 new。old 必须在文件中唯一存在（除非 replace_all=true），否则会报错并告诉你出现了几次 —— 此时请先把 old 写长一点以唯一确定位置。写前自动备份、返回 unified diff。",
             "parameters": {
                 "type": "object",
@@ -143,6 +150,7 @@
         },
         {
             "name": "delete_file",
+            "risk": "high",
             "description": "删除文件。删除前会自动备份到 .meido_backups/，路径必须在白名单内；不想要这个能力就在 manifest.json 关掉 config.write.allow_delete。",
             "parameters": {
                 "type": "object",

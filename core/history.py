@@ -275,24 +275,35 @@ class HistoryManager:
         return list(self._read_current())
 
     def load_recent(self, n: int = 20) -> list:
-        messages = self._read_current()
-        recent = messages[-(n * 2):]
+        """最近 n 轮的 (用户, 助手) **文本**对，供检索做上下文。
+
+        ⚠️ 必须先把工具轮次的消息滤掉。api_state 里除了 user / assistant 文本，
+        还夹着 `assistant(带 tool_calls)` 与 `tool` 结果（为了让模型下一轮还记得
+        工具拿到了什么）。它们既不是对话内容，也会打乱「user 后面紧跟 assistant」
+        的配对假设 —— 按固定步长切会配出正文为空的假轮次，污染检索查询。
+        """
+        text_msgs = [
+            m for m in self._read_current()
+            if m.get("role") in ("user", "assistant")
+            and isinstance(m.get("content"), str) and m["content"].strip()
+            and not m.get("tool_calls")
+        ]
+        recent = text_msgs[-(n * 2):]
         pairs = []
         i = 0
         while i < len(recent):
-            user_msg = None
+            if recent[i]["role"] != "user":
+                i += 1
+                continue
+            user_msg = recent[i]["content"]
             bot_msg = None
-            if i < len(recent) and recent[i]["role"] == "user":
-                user_msg = recent[i]["content"]
-                if i + 1 < len(recent) and recent[i + 1]["role"] == "assistant":
-                    bot_msg = recent[i + 1]["content"]
-                    i += 2
-                else:
-                    i += 1
-                if user_msg:
-                    pairs.append([user_msg, bot_msg])
+            if i + 1 < len(recent) and recent[i + 1]["role"] == "assistant":
+                bot_msg = recent[i + 1]["content"]
+                i += 2
             else:
                 i += 1
+            if user_msg:
+                pairs.append([user_msg, bot_msg])
         return pairs
 
     def count_messages(self) -> int:

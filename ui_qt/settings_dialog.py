@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -51,6 +50,7 @@ from core.logging_utils import log_file
 from core.paths import app_path, to_app_path
 
 from . import theme
+from .themed_dialog import confirm, info, warn
 from .theme import APPEARANCE_PRESETS
 from .theme_editor import ThemeEditorDialog
 
@@ -334,8 +334,9 @@ class SettingsDialog(QDialog):
         if len(mc.sites) <= 1:
             self.model_status.setText("至少保留一个站点")
             return
-        answer = QMessageBox.question(self, "删除站点", f"确定删除站点「{site.name}」吗？")
-        if answer != QMessageBox.StandardButton.Yes:
+        if not confirm(self, "删除站点", f"确定删除站点「{site.name}」吗？",
+                       informative="该站点的密钥引用会一并移除，不可恢复。",
+                       ok="删除", danger=True):
             return
         mc.sites = [s for s in mc.sites if s.name != site.name]
         if mc.active_site == site.name:
@@ -714,6 +715,23 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(8)
 
+        # ── 安全：风险工具总开关 ──
+        risk_title = QLabel("安全")
+        risk_title.setProperty("class", "section")
+        layout.addWidget(risk_title)
+
+        self.allow_risky_check = QCheckBox("允许 AI 自动调用高风险工具")
+        self.allow_risky_check.setToolTip(
+            "包括：文件写入 / 修改 / 删除，打开可执行类文件，以及 MCP 受限工具。")
+        layout.addWidget(self.allow_risky_check)
+
+        risk_note = QLabel(
+            "默认关闭。关闭时 AI 看不到也无法调用上述工具；"
+            "用户手动输入的命令（如 /delete_file）不受此开关限制。")
+        risk_note.setProperty("class", "status")
+        risk_note.setWordWrap(True)
+        layout.addWidget(risk_note)
+
         title = QLabel("插件开关")
         title.setProperty("class", "section")
         layout.addWidget(title)
@@ -780,6 +798,7 @@ class SettingsDialog(QDialog):
         except Exception as exc:
             self.plugins_status.setText(f"读取失败：{exc}")
             return
+        self.allow_risky_check.setChecked(bool(cfg.allow_risky_tools))
         disabled = {str(n) for n in (cfg.disabled or [])}
         per_plugin = cfg.per_plugin or {}
 
@@ -813,6 +832,24 @@ class SettingsDialog(QDialog):
         except (TypeError, ValueError):
             self.ip_timeout_spin.setValue(120)
         self.plugins_status.setText("")
+        # 记一份「插件运行态」表单快照：保存时用来判断要不要重建插件
+        self._plugins_snapshot = self._plugins_form_state()
+
+    def _plugins_form_state(self) -> dict:
+        """插件页「运行态」表单快照：只有开关 / 参数变化才需要重建插件。
+
+        风险工具开关刻意不含在内：单改它不应重启插件（尤其是 MCP 子进程），
+        策略在每次构造工具列表 / 每次执行前实时读取，下一次调用即生效。
+        """
+        return {
+            "enabled": {name: check.isChecked()
+                        for name, check in self.plugin_checks.items()},
+            "web_search": (self.ws_proxy_http_edit.text().strip(),
+                           self.ws_proxy_https_edit.text().strip()),
+            "image_processor": (self.ip_comfy_edit.text().strip(),
+                                self.ip_output_edit.text().strip(),
+                                int(self.ip_timeout_spin.value())),
+        }
 
     def _save_plugins(self) -> None:
         try:
@@ -820,6 +857,9 @@ class SettingsDialog(QDialog):
         except Exception as exc:
             self.plugins_status.setText(f"读取失败：{exc}")
             return
+
+        before_policy = bool(cfg.allow_risky_tools)
+        before_form = getattr(self, "_plugins_snapshot", None)
 
         per_plugin = {k: dict(v) for k, v in (cfg.per_plugin or {}).items()
                       if isinstance(v, dict)}
@@ -843,13 +883,24 @@ class SettingsDialog(QDialog):
 
         cfg.disabled = disabled
         cfg.per_plugin = per_plugin
+        cfg.allow_risky_tools = self.allow_risky_check.isChecked()
         try:
             self._engine.config.save_plugins_config(cfg)
         except Exception as exc:
             self.plugins_status.setText(f"保存失败：{exc}")
             return
         self.plugins_status.setText("已写入 config/plugins.toml")
-        self.config_saved.emit("plugins")
+
+        current_form = self._plugins_form_state()
+        runtime_changed = before_form is None or current_form != before_form
+        self._plugins_snapshot = current_form
+        policy_changed = bool(cfg.allow_risky_tools) != before_policy
+
+        # 只改了风险开关（插件运行态没动）时不要重建插件 —— MCP 子进程不必重启。
+        if runtime_changed or not policy_changed:
+            self.config_saved.emit("plugins")
+        else:
+            self.config_saved.emit("tool_policy")
 
     # ── Live2D ──
 
@@ -1441,12 +1492,12 @@ class SettingsDialog(QDialog):
         try:
             from core.console_window import attach_console
         except Exception as exc:
-            QMessageBox.warning(self, "打开调试窗口", f"无法加载控制台模块：{exc}")
+            warn(self, "打开调试窗口", f"无法加载控制台模块：{exc}")
             return
         ok = attach_console()
         self._refresh_console_status()
         if not ok:
-            QMessageBox.warning(
+            warn(
                 self, "打开调试窗口",
                 "分配控制台失败。\n\n"
                 "· 如果程序是从终端启动的，输出本来就在那个终端里，不需要这个开关；\n"
@@ -1480,8 +1531,8 @@ class SettingsDialog(QDialog):
 
         path = log_file()
         if not path.exists():
-            QMessageBox.information(
-                self, "日志", f"日志文件尚未生成：\n{path}\n\n运行日志会写入 data/logs/。")
+            info(self, "日志",
+                 f"日志文件尚未生成：\n{path}\n\n运行日志会写入 data/logs/。")
             return
         MainWindow.open_path(path)
 

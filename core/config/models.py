@@ -135,6 +135,9 @@ class PluginsConfig:
     directory: str = "plugins"
     disabled: list = field(default_factory=list)
     per_plugin: dict = field(default_factory=dict)
+    # 允许 AI 自动调用高风险工具（文件写/改/删、打开可执行类、MCP 受限工具）。
+    # 默认关闭；只约束 AI 自动调用，用户手输命令不受影响（见设计规格 §2）。
+    allow_risky_tools: bool = False
 
 
 @dataclass

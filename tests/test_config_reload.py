@@ -201,6 +201,28 @@ class TestLoaderRoundTrip:
         text = (cfg / "plugins.toml").read_text(encoding="utf-8")
         assert str(APP_DIR) not in text
 
+    def test_risky_tools_flag_round_trip(self, cfg):
+        """allow_risky_tools：缺字段默认关闭；保存后能读回；原有参数不丢。"""
+        loader = ConfigLoader(str(cfg))
+        assert loader.get_plugins_config().allow_risky_tools is False
+
+        cur = loader.get_plugins_config()
+        cur.allow_risky_tools = True
+        loader.save_plugins_config(cur)
+
+        fresh = ConfigLoader(str(cfg)).get_plugins_config()
+        assert fresh.allow_risky_tools is True
+        assert fresh.per_plugin["web_search"]["proxy_http"] == "http://127.0.0.1:7897"
+
+    def test_risky_tools_flag_non_bool_falls_back(self, cfg):
+        """字符串 "true" 不是布尔，必须回落为 False（fail-closed）。"""
+        path = cfg / "plugins.toml"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "disabled = []", 'disabled = []\nallow_risky_tools = "true"'),
+            encoding="utf-8")
+        assert ConfigLoader(str(cfg)).get_plugins_config().allow_risky_tools is False
+
 
 # ── 2. 重载：缓存与快照 ──
 
@@ -404,6 +426,17 @@ class TestConfigSavedDispatch:
         assert eng.plugin_manager is not old
         assert eng.pm is eng.plugin_manager
         assert "插件" in win.sidebar.msgs[-1]
+
+    def test_tool_policy_does_not_reload_plugins(self, cfg, plugins_dir):
+        """风险开关：只提示，不重建插件管理器（MCP 子进程不能重启）。"""
+        eng = _EngineStub(cfg)
+        win = _main_window_stub(eng)
+        old = eng.plugin_manager
+
+        win._on_config_saved("tool_policy")
+
+        assert eng.plugin_manager is old          # 管理器对象没被换掉
+        assert "风险工具" in win.sidebar.msgs[-1]
 
     def test_live2d_stops_old_watch_and_clears_layer(self, cfg, plugins_dir):
         """旧装配必须彻底停掉：就绪轮询还在跑会覆盖新立绘的状态提示。"""

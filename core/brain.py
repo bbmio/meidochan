@@ -27,7 +27,9 @@ from typing import Generator, List, Dict, Any, Optional, Callable
 
 from core.config.models import ModelConfig, PersonaConfig
 from core.config.loader import ConfigLoader
+from core.logging_utils import log
 from core.paths import app_path
+from core.tool_outputs import page_out
 
 
 def _load_user_id(config_loader: ConfigLoader) -> str:
@@ -191,6 +193,110 @@ def _get_reasoning(delta) -> str:
 # `time` 服务于界面显示与会话索引（core.history 落盘时写、ui_qt 回放时读），
 # 但 OpenAI 兼容接口只认 role / content / tool_calls 等字段，多带字段有被拒的风险。
 _LOCAL_ONLY_KEYS = ("time",)
+
+
+def usage_snapshot(usage) -> Optional[dict]:
+    """把 API 返回的 usage 归一化成普通 dict（日志与界面共用）。
+
+    ⚠️ 本地模型（Ollama）**不返回** `prompt_cache_hit_tokens` /
+    `prompt_cache_miss_tokens`，此时 hit / miss 是 `None` —— 调用方要据此显示
+    「---」并注明原因，而不是把它当成 0% 命中（那会误导人以为缓存坏了）。
+    """
+    if usage is None:
+        return None
+    return {
+        "prompt": getattr(usage, "prompt_tokens", None),
+        "completion": getattr(usage, "completion_tokens", None),
+        "hit": getattr(usage, "prompt_cache_hit_tokens", None),
+        "miss": getattr(usage, "prompt_cache_miss_tokens", None),
+    }
+
+
+def _log_usage(usage, where: str = "") -> None:
+    """把一次 API 调用的 token 用量写进日志。
+
+    DeepSeek 在 usage 上额外给了 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+    —— 这是判断「请求前缀是否稳定」的**唯一客观指标**。命中率突然掉下来，通常意味着
+    前缀里混进了每次都变的东西（动态系统提示词、工具定义顺序抖动等）。
+    本地模型（Ollama）不返回这两个字段，此时只记 prompt / completion。
+
+    ⚠️ 流式响应里 usage **只出现在最后一个 chunk**，而且那个 chunk 的 `choices` 是空的
+    —— 取值必须在 `if not chunk.choices: continue` **之前**，否则永远拿不到。
+    """
+    snap = usage_snapshot(usage)
+    if snap is None:
+        return
+    parts = [f"prompt={snap['prompt']}", f"completion={snap['completion']}"]
+    if snap["hit"] is not None or snap["miss"] is not None:
+        hit, miss = int(snap["hit"] or 0), int(snap["miss"] or 0)
+        total = hit + miss
+        rate = f"{hit / total * 100:.1f}%" if total else "n/a"
+        parts.append(f"缓存命中={hit}")
+        parts.append(f"未命中={miss}")
+        parts.append(f"命中率={rate}")
+    tag = f"{where} " if where else ""
+    log.info("[用量] %s%s", tag, " ".join(parts))
+
+
+# ── 上下文预算 ──
+#
+# 系数是**实测**出来的（DeepSeek tokenizer）：中文 ≈1.72 字符/token、英文 ≈4.9、
+# 代码 ≈2.5。所以**不能**统一按 chars/4 估 —— 那对中文会低估约 2.3 倍。
+# 按字符类别分开算，在 5 个样本（纯中文 / 纯英文 / 纯代码 / 真实 system prompt /
+# 真实 tools JSON）上最大误差 13%，配合留足余量的预算足够用。
+
+#: 中日韩文字与全角标点 —— token 化效率最低的一类（约 1.7 字符/token）
+_CJK_RE = re.compile(r"[\u3000-\u303f\u3040-\u30ff\u4e00-\u9fff\uff00-\uffef]")
+#: 英文数字与空白 —— token 化效率最高的一类（约 4.6 字符/token）
+_PLAIN_RE = re.compile(r"[A-Za-z0-9 \t\n]")
+
+#: 已知支持大窗口的云端服务商。**其余一律按保守值算** ——
+#: 未知窗口时宁可多裁一点历史，也不要超窗报错（报错是硬失败，多裁只是少点历史）。
+#: `custom` 也可能指向一个 128K 的端点，但我们无法确定，所以按保守值走。
+LARGE_WINDOW_PROVIDERS = {"deepseek"}
+#: 大窗口服务商的上下文窗口（token）
+LARGE_CONTEXT_WINDOW = 128_000
+#: 其余情况（本地 ollama / lmstudio、custom、未知）一律按这个保守值
+SAFE_CONTEXT_WINDOW = 32_000
+#: 预算占窗口的比例。留足余量给「输出 + 估算误差（±13%）」。
+CONTEXT_BUDGET_RATIO = 0.6
+#: 裁剪水位：超过预算的这个比例才动手。**不到水位一条都不丢** ——
+#: 每轮都裁等于每轮都破坏 prompt cache（失效边界在第一个被改动的 token 处）。
+TRIM_TRIGGER_RATIO = 0.8
+
+
+def estimate_tokens(text: str) -> int:
+    """粗略估算一段文本的 token 数（系数来源见上方注释）。"""
+    if not text:
+        return 0
+    cjk = len(_CJK_RE.findall(text))
+    plain = len(_PLAIN_RE.findall(text))
+    rest = len(text) - cjk - plain          # 标点 / 符号 / emoji：token 化最碎
+    return int(cjk / 1.7 + plain / 4.6 + rest / 1.27) + 1
+
+
+def _message_tokens(message: dict) -> int:
+    """一条消息的 token 估算（含 role 与 tool_calls 的固定开销）。
+
+    ⚠️ `reasoning_content` 也要算：DeepSeek V4 起，带 tool_calls 的 assistant 消息
+    必须把思考链**原样回传**，它是真实占用前缀的。
+    """
+    total = 4                                # role + 分隔符的固定开销
+    for key in ("content", "reasoning_content"):
+        value = message.get(key)
+        if isinstance(value, str):
+            total += estimate_tokens(value)
+    for tc in message.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        total += estimate_tokens(str(fn.get("name") or ""))
+        total += estimate_tokens(str(fn.get("arguments") or ""))
+        total += 8                           # id / type 等固定字段
+    return total
+
+
+def _messages_tokens(messages) -> int:
+    """整个消息列表的 token 估算。"""
+    return sum(_message_tokens(m) for m in messages if isinstance(m, dict))
 
 
 def _api_messages(messages: list) -> list:
@@ -460,6 +566,11 @@ class Brain:
             kwargs["tool_choice"] = tool_choice
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if stream:
+            # 让服务端在**最后一个 chunk** 里带上 usage（含 DeepSeek 的 prompt cache 命中数）。
+            # 不加这个参数时流式响应里完全没有 usage，缓存命中率就无从观测。
+            # 实测 DeepSeek 与 Ollama 的 OpenAI 兼容端点都接受该参数，且不改变输出内容。
+            kwargs["stream_options"] = {"include_usage": True}
         return kwargs
 
     # ── 重试装饰器 ──
@@ -493,6 +604,7 @@ class Brain:
             temperature=temperature, thinking=False)
         kwargs["messages"] = messages
         response = self._client.chat.completions.create(**kwargs)
+        _log_usage(getattr(response, "usage", None), "后台调用")
         content = response.choices[0].message.content
         if content is None:
             print(" quick_chat: API 返回 content=None")
@@ -516,6 +628,7 @@ class Brain:
                 nsk = self._build_api_kwargs(stream=False, tools=None, tool_choice=None)
                 nsk["messages"] = messages
                 resp = self._client.chat.completions.create(**nsk)
+                _log_usage(getattr(resp, "usage", None), "非流式生成")
                 full_text = resp.choices[0].message.content or ""
                 reasoning = getattr(resp.choices[0].message, "reasoning_content", "") or ""
                 if full_text:
@@ -528,7 +641,14 @@ class Brain:
             skw = self._build_api_kwargs(stream=True, tools=None, tool_choice=None)
             skw["messages"] = messages
             stream_response = self._client.chat.completions.create(**skw)
+            usage = None
             for chunk in stream_response:
+                # usage 只在最后一个 chunk 上，而那个 chunk 的 choices 是**空的**
+                # —— 必须在下面的 continue 之前取，否则永远拿不到
+                if getattr(chunk, "usage", None) is not None:
+                    usage = chunk.usage
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta
                 if hasattr(delta, "reasoning_content") and delta.reasoning_content:
                     if not reasoning:
@@ -544,6 +664,7 @@ class Brain:
                         on_chunk(delta.content)
             if reasoning:
                 print()
+            _log_usage(usage, "流式生成")
         except Exception as e:
             print(f" 流式生成失败: {e}")
 
@@ -559,6 +680,7 @@ class Brain:
                     messages=fb_msgs,
                     extra_body=self._get_extra_body(),
                 )
+                _log_usage(getattr(resp, "usage", None), "补充请求")
                 full_text = resp.choices[0].message.content or ""
             except Exception as e:
                 print(f" 补充请求失败: {e}")
@@ -567,48 +689,93 @@ class Brain:
 
     # ── 消息完整性维护 ──
     def _ensure_complete_tool_calls(self, messages):
+        """确保每个 `assistant(tool_calls)` 后面都跟齐它声明的**全部** tool 结果。
+
+        OpenAI 兼容接口对这条是硬要求，少一条就直接 400：
+        「An assistant message with 'tool_calls' must be followed by tool messages
+        responding to each 'tool_call_id'」。所以配不齐时**整组一起丢** ——
+        只丢一半会留下一个更坏的中间状态（正是这个函数的旧实现干的事）。
+
+        ⚠️ 旧实现只检查「紧邻的前一条是不是带 tool_calls 的 assistant」，
+        于是一个 assistant 声明了 **2 个以上** tool_calls 时，第 2 条起全被丢掉，
+        直接触发上面那个 400。它在工具结果**不跨轮保留**的年代碰不到
+        （api_state 里根本没有 tool 消息），2026-10-03 让工具结果跨轮保留之后才暴露。
+        """
         cleaned = []
-        skip_next_tools = 0
-        for i, msg in enumerate(messages):
-            if skip_next_tools > 0:
-                if msg.get("role") == "tool":
-                    skip_next_tools -= 1
-                    continue
-                else:
-                    skip_next_tools = 0
-
+        i = 0
+        total = len(messages)
+        while i < total:
+            msg = messages[i]
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                tool_calls = msg["tool_calls"]
-                required_ids = [tc["id"] for tc in tool_calls if "id" in tc]
-                next_msgs = messages[i + 1:]
-                actual_tools = []
-                for nxt in next_msgs:
-                    if nxt.get("role") != "tool":
-                        break
-                    actual_tools.append(nxt)
-                actual_ids = [t.get("tool_call_id") for t in actual_tools]
-                if len(required_ids) != len(actual_ids) or any(
-                    req != act for req, act in zip(required_ids, actual_ids)
-                ):
-                    skip_next_tools = len(actual_tools)
-                    continue
-
+                want = [tc.get("id") for tc in msg["tool_calls"] if tc.get("id")]
+                # 收集**连续**的 tool 结果（不是只看紧邻那一条）
+                got = []
+                j = i + 1
+                while j < total and messages[j].get("role") == "tool":
+                    got.append(messages[j].get("tool_call_id"))
+                    j += 1
+                if want and len(got) == len(want) and set(got) == set(want):
+                    cleaned.append(msg)
+                    cleaned.extend(messages[i + 1:j])
+                # 配不齐就整组跳过：assistant 与它后面那串 tool 一起丢。
+                # 保留「有 tool_calls 却没人应答」的 assistant 会直接 400，
+                # 保留游离的 tool 结果同样会 400。
+                i = j
+                continue
             if msg.get("role") == "tool":
-                if i == 0 or messages[i - 1].get("role") != "assistant" or not messages[i - 1].get("tool_calls"):
-                    continue
+                i += 1          # 游离的 tool 结果（前面没有对应的 assistant）
+                continue
             cleaned.append(msg)
+            i += 1
         return cleaned
 
-    def _trim_messages(self, messages, max_messages=40):
-        if len(messages) <= max_messages:
-            return messages
+    def _context_window(self) -> int:
+        """当前模型的上下文窗口（token）。
+
+        只对**已知**的大窗口服务商给 128K，其余一律走保守值 —— 猜大了会超窗报错，
+        猜小了只是多裁一点历史，后者可以接受。
+        （要做成「每个模型站点可配」的话，需要给 ModelConfig / ModelSite 加字段
+        并接上 loader 与设置界面，目前没做。）
+        """
+        if self.model_config.provider in LARGE_WINDOW_PROVIDERS:
+            return LARGE_CONTEXT_WINDOW
+        return SAFE_CONTEXT_WINDOW
+
+    def _trim_messages(self, messages, budget=None, reserved=0):
+        """按 **token 预算** 裁剪历史，而不是消息条数。
+
+        ⚠️ 单位是关键。原先数的是「条数」（40 条），但真正的约束是 token：
+        40 条短消息可能只有 3K token（白白丢掉还有余量的历史），40 条带工具的消息
+        可能 80K+；而且带工具时**一条用户提问会产生好几条消息**，40 条可能只等于
+        4~8 轮对话。
+
+        ⚠️ 触发策略：**不到水位一条都不丢**。每轮都裁等于每轮都破坏 prompt cache
+        （失效边界在第一个被改动的 token 处），所以宁可攒到接近上限再批量裁。
+
+        `reserved`：给工具定义等「不在 messages 里、但同属一个前缀」的内容留的余量。
+        """
+        if budget is None:
+            budget = int(self._context_window() * CONTEXT_BUDGET_RATIO) - reserved
+        budget = max(budget, 2_000)             # 兜底：预算算成负数就退回一个最小值
+
+        total = _messages_tokens(messages)
+        if total <= budget * TRIM_TRIGGER_RATIO:
+            return messages                     # 没到水位：原样返回
+
         system_msgs = [m for m in messages if m.get("role") == "system"]
         non_system = [m for m in messages if m.get("role") != "system"]
-        if len(non_system) <= max_messages:
-            return system_msgs + non_system
 
-        start_idx = len(non_system) - max_messages
+        # 从头部丢最旧的，直到落回预算内。边丢边减，不重算总量（O(n)）。
+        remaining = total - _messages_tokens(system_msgs)
+        start_idx = 0
+        while start_idx < len(non_system) and remaining > budget:
+            remaining -= _message_tokens(non_system[start_idx])
+            start_idx += 1
+
         trimmed = non_system[start_idx:]
+        # 起点不能是「孤儿」：tool 结果必须跟着它的 assistant(tool_calls) 一起留，
+        # 而 assistant(tool_calls) 后面必须跟齐它声明的**全部** tool 结果 ——
+        # 少一条，OpenAI 兼容接口就会直接报错。
         for _ in range(20):
             if start_idx == 0:
                 break
@@ -645,7 +812,10 @@ class Brain:
                     continue
             break
         if len(system_msgs) + len(trimmed) < len(messages):
-            print(f" 消息列表已裁剪：{len(messages)}  {len(system_msgs) + len(trimmed)} 条")
+            print(f" 上下文超预算，已裁剪：{len(messages)} → "
+                  f"{len(system_msgs) + len(trimmed)} 条"
+                  f"（约 {total} → {_messages_tokens(system_msgs + trimmed)} token，"
+                  f"预算 {budget}）")
         return system_msgs + trimmed
 
     def _safe_json_loads(self, arguments_str: str) -> dict:
@@ -699,6 +869,9 @@ class Brain:
         _plugin_tools = plugin_tools or []
         all_tools = _plugin_tools + BUILTIN_TOOLS
         builtin_names = {t["function"]["name"] for t in BUILTIN_TOOLS}
+        # 工具定义不在 messages 里，但同属一个请求前缀（本项目 19 个工具约 2.5K token）
+        # —— 算预算时必须给它留出来，否则 messages 会挤占掉工具的位置。
+        _tool_tokens = estimate_tokens(json.dumps(all_tools, ensure_ascii=False))
 
         SAFE_REPEAT_TOOLS = {"get_status"}
         last_fingerprint = ""
@@ -728,7 +901,7 @@ class Brain:
                 yield {"type": "done", "content": "（已停止生成）", "reasoning": ""}
                 return
 
-            messages = self._trim_messages(messages, max_messages=40)
+            messages = self._trim_messages(messages, reserved=_tool_tokens)
             kwargs = self._build_api_kwargs(tools=all_tools, tool_choice="auto", stream=True)
             kwargs["messages"] = messages
             # DEBUG：thinking=DeepSeek 思考参数，think=Ollama 本地思考参数（都显示）
@@ -764,9 +937,14 @@ class Brain:
             acc_tool_calls = []
 
             try:
+                turn_usage = None
                 for chunk in stream_response:
                     if _stop_event.is_set():
                         break
+                    # usage 只在最后一个 chunk 上，而那个 chunk 的 choices 是**空的**
+                    # —— 必须在下面的 continue 之前取，否则永远拿不到
+                    if getattr(chunk, "usage", None) is not None:
+                        turn_usage = chunk.usage
                     if not chunk.choices:
                         continue
                     delta = chunk.choices[0].delta
@@ -813,6 +991,16 @@ class Brain:
             if acc_content:
                 print(f"[正文 #{iteration+1} 完整 {len(acc_content)} 字]")
 
+            # 本轮调用的 token 用量（含 prompt cache 命中率）。工具循环每轮都会打一行，
+            # 命中率掉下来就是前缀被改动的信号。
+            _log_usage(turn_usage, f"主对话 第{iteration+1}轮")
+            # 同时上报给界面（状态栏的缓存命中率）。只报**主对话**这一路 ——
+            # 后台调用（会话摘要 / 概览卡抽取）走的是 `_generate_text` / `quick_chat`，
+            # 报上来只会把状态栏刷成噪音。
+            snap = usage_snapshot(turn_usage)
+            if snap is not None:
+                yield {"type": "usage", "usage": snap}
+
             if _stop_event.is_set():
                 # 用户手动停止：用已生成的部分内容收尾
                 print(" [用户停止] 生成被手动中断")
@@ -847,6 +1035,13 @@ class Brain:
             if acc_reasoning:
                 assistant_msg["reasoning_content"] = acc_reasoning
             messages.append(assistant_msg)
+
+            # 本轮新增的消息（assistant + 各 tool 结果）。收完后一次性 yield 给调用方
+            # 持久化 —— 不 yield 的话它们只活在本函数内部的临时副本里（engine 传进来的
+            # 是 `list(api_state)` 的浅拷贝），**下一轮模型就完全看不到上一轮的工具结果**。
+            # 实测过：模型会自己发现「我上下文里没留着之前那次列目录的记录」，
+            # 然后重新调一次同样的工具。这正是书里警告的「反复执行相同工具调用」。
+            round_messages = [assistant_msg]
 
             for tc in acc_tool_calls:
                 func_name = tc["function"]["name"]
@@ -893,15 +1088,25 @@ class Brain:
                 if not result:
                     result = result_box.get("result", result_box.get("error", ""))
 
-                messages.append({
+                # 超长结果落盘，上下文里只放路径 + 首尾预览。
+                # ⚠️ 这**不是截断**：原文逐字节存着，模型需要时按行读回。
+                # 单次读文件可以吐 10 万字符，直接塞进上下文一次就吃掉大半个预算；
+                # 而直接截断会让模型后面要用到的细节彻底找不回来。
+                tool_msg = {
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": str(result),
-                })
+                    "content": page_out(tc["id"], result),
+                }
+                messages.append(tool_msg)
+                round_messages.append(tool_msg)
 
                 if _stop_event.is_set():
                     print(f" [用户停止] 工具 {func_name} 执行被中断，结束本轮")
                     break
+
+            # 上报本轮的工具交互，供调用方写进持久化的 api_state。
+            # 放在 for 之后（而不是循环里逐条 yield）：中断时也能把已拿到的结果带上。
+            yield {"type": "tool_messages", "messages": round_messages}
 
             # 这一轮的工具全部返回了 —— 「哦，拿到了」的真实时刻。
             # 原来挂在 `正在生成最终回复` 那个状态行上，但那是死代码，所以
@@ -929,7 +1134,8 @@ class Brain:
             "role": "user",
             "content": "以上是你要用到的所有信息和工具返回结果。请根据已获得的信息，用自然语言直接回答，不要再调用任何工具。",
         })
-        messages = self._trim_messages(messages, max_messages=30)
+        # 这里**不带工具**（下面 _generate_text 传 tools=None），所以不用给工具定义留余量
+        messages = self._trim_messages(messages)
 
         print(" 请求最终总结...")
         chunks = []

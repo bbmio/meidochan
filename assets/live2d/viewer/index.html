@@ -64,6 +64,10 @@
   var clickIndex = -1;
   var stateExpression = "";      // 最近一次由对话状态驱动的表情
   var clickTimer = null;
+  /* 按下→抬起之间，**屏幕坐标**的曼哈顿位移超过这个值就算拖动，不触发表情轮换。
+     与 Qt 侧 live2d_window.py 的拖动阈值保持一致（那边是 manhattanLength() > 3），
+     这样「Qt 认为在拖」与「页面认为在拖」的边界对齐。 */
+  var CLICK_SLOP = 3;
   var stageEl = document.getElementById("stage");
   var errorEl = document.getElementById("error");
 
@@ -169,6 +173,27 @@
       }, clickRevert * 1000);
     }
   }
+
+  /* 这次按下→抬起是否算一次「点击」（而不是拖动）。
+
+     maxMoved = 整个手势过程中**最大**的屏幕坐标曼哈顿位移。
+     ⚠️ 用「最大值」而不是「起止两点」：拖出去再拖回原点时起止位移是 0，
+     只看首尾会把它误判成一次点击。
+
+     ⚠️ 必须用**屏幕坐标**：拖动桌宠时 Qt 会同步 move() 窗口，指针相对窗口的
+     位置几乎不变，clientX/clientY 全程恒定 —— 用它们算位移会得到 0，判不出拖动。
+
+     抽成具名函数是为了能单独验证阈值行为（见 tools/probe_live2d_gesture.js）。 */
+  function isClickGesture(maxMoved) {
+    return maxMoved <= CLICK_SLOP;
+  }
+
+  /* 屏幕坐标的曼哈顿位移，与 Qt 侧 manhattanLength() 同一度量。 */
+  function manhattan(x0, y0, x1, y1) {
+    return Math.abs(x1 - x0) + Math.abs(y1 - y0);
+  }
+  api.isClickGesture = isClickGesture;
+  api.manhattan = manhattan;
 
   api.setInteraction = function (opts) {
     opts = opts || {};
@@ -441,6 +466,17 @@
 
       /* 视线跟随光标；停下来一段时间后自动回正，光标移出窗口也立刻回正。 */
       window.addEventListener("mousemove", function (e) {
+        if (pressAt) {
+          if (e.buttons & 1) {
+            // 累计整个手势过程中的最大位移，供抬起时判定
+            var moved = manhattan(pressAt.x, pressAt.y, e.screenX, e.screenY);
+            if (moved > pressAt.max) { pressAt.max = moved; }
+          } else {
+            // 抬起事件丢了（比如在窗口外松手）：清掉，免得下一次无关的
+            // mouseup 被当成点击
+            pressAt = null;
+          }
+        }
         applyFocus(e.clientX, e.clientY);
         scheduleFocusRest();
       });
@@ -450,9 +486,29 @@
         resetFocus();
       });
 
-      /* 点击立绘 → 轮换表情（只有落在模型包围盒内才算，避免点空白也触发） */
-      window.addEventListener("click", function (e) {
+      /* 点击立绘 → 轮换表情（只有落在模型包围盒内才算，避免点空白也触发）。
+       *
+       * ⚠️ 这里**不能**用 DOM 的 click 事件：click 只要「按下与抬起落在同一元素」
+       * 就派发，**与位移无关**。而拖动桌宠时 Qt 会同步 move() 窗口，指针相对窗口的
+       * 位置几乎不变 —— 抬起时照样派发 click，表现就是「一拖就换表情」。
+       */
+      var pressAt = null;
+      window.addEventListener("mousedown", function (e) {
+        // 只认左键。落在边缘缩放区时 Qt 会消费掉事件，这里收不到 mousedown，
+        // 随后的 mouseup 会因为 pressAt 为空而自动忽略。
+        pressAt = (e.button === 0)
+          ? { x: e.screenX, y: e.screenY, max: 0 }
+          : null;
+      });
+
+      window.addEventListener("mouseup", function (e) {
+        var start = pressAt;
+        pressAt = null;
+        if (!start || e.button !== 0) { return; }
         if (!model || !clickExpressions.length) { return; }
+        // 以过程最大位移判定：超过阈值就是一次拖动，不是点击
+        var moved = Math.max(start.max, manhattan(start.x, start.y, e.screenX, e.screenY));
+        if (!isClickGesture(moved)) { return; }
         try {
           var b = model.getBounds();
           if (e.clientX < b.x || e.clientX > b.x + b.width) { return; }

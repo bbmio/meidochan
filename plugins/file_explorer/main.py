@@ -449,12 +449,60 @@ def _diff(old: str, new: str, path: Path) -> str:
     return text.rstrip()
 
 
+#: 校验结果三态。**「跳过」不等于「失败」** —— 环境不具备时不能回滚，
+#: 否则打包版里任何对 plugins/** 的修改都会被必然失败的回滚掉（见 _verify）。
+VERIFY_PASS = "pass"
+VERIFY_FAIL = "fail"
+VERIFY_SKIP = "skip"
+
+
+def _verify_missing_reason(cfg: dict) -> str:
+    """校验环境是不是**根本跑不起来**（而不是「代码被改坏了」）。
+
+    ⚠️ 打包版里 `python -m pytest tests -q` 是**必然失败**的，原因有两层：
+      1. `dist/meido/` 里没有 `tests/` 目录，pytest 直接报
+         `ERROR: file or directory not found: tests`；
+      2. 那个 `python` 是**系统解释器**，没装本项目的依赖（chromadb / PySide6…）。
+
+    以前这两种情况都被判成「校验未通过」→ 每次写 `plugins/**` 都被回滚，
+    表现成「打包版改不了自己的代码」。所以由配置显式声明这条命令依赖哪些路径
+    （`verify_requires`）：缺了就是**环境不具备**，跳过校验且**不回滚**。
+    """
+    for item in (cfg.get("verify_requires") or []):
+        if not (Path(APP_DIR) / str(item)).exists():
+            return f"校验环境不具备：{item} 不存在"
+    return ""
+
+
+def _classify_verify(returncode: int) -> str:
+    """把校验命令的退出码映射成三态。
+
+    ⚠️ pytest 的 **4** = usage error（文件/目录找不到，打包版就是这个：
+    `ERROR: file or directory not found: tests`）、**5** = 没收集到用例 ——
+    这两个是**环境问题**，不是「代码改坏了」。判成失败会把好改动也回滚掉。
+
+    单独抽出来是为了可测：直接喂退出码就能覆盖全部三态，不必真去起子进程
+    （起子进程在沙箱里会被拦，报 WinError 50/6，是环境抖动而非逻辑问题）。
+    """
+    if returncode == 0:
+        return VERIFY_PASS
+    if returncode in (4, 5):
+        return VERIFY_SKIP
+    return VERIFY_FAIL
+
+
 def _verify():
-    """跑验证命令（默认 pytest）。返回 (是否通过, 输出尾部)。"""
+    """跑验证命令（默认 pytest）。返回 `(结果, 输出)`。
+
+    结果取 `VERIFY_PASS` / `VERIFY_FAIL` / `VERIFY_SKIP` 三态之一。
+    """
     cfg = _write_cfg()
     command = str(cfg.get("verify_command") or "").strip()
     if not command:
-        return True, "（未配置 verify_command，跳过校验）"
+        return VERIFY_SKIP, "（未配置 verify_command，跳过校验）"
+    missing = _verify_missing_reason(cfg)
+    if missing:
+        return VERIFY_SKIP, f"（{missing}，跳过校验）"
     timeout = int(cfg.get("verify_timeout", 180))
     try:
         proc = subprocess.run(
@@ -462,11 +510,12 @@ def _verify():
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
-        return False, f"校验超时（>{timeout}s）"
+        return VERIFY_FAIL, f"校验超时（>{timeout}s）"
     except Exception as exc:
-        return False, f"校验命令执行失败：{exc}"
+        return VERIFY_FAIL, f"校验命令执行失败：{exc}"
     output = "\n".join(((proc.stdout or "") + (proc.stderr or "")).splitlines()[-15:])
-    return proc.returncode == 0, output or f"（无输出，退出码 {proc.returncode}）"
+    return _classify_verify(proc.returncode), \
+        (output or f"（无输出，退出码 {proc.returncode}）")
 
 
 def _audit(entry: dict) -> None:
@@ -527,12 +576,17 @@ def _commit(path: Path, new_content: str, old_content: str, action: str):
         lines.append(f"备份：{backup}")
 
     verified = None
+    verify_result = ""
     rolled_back = False
     if protected:
-        ok, output = _verify()
-        verified = ok
-        if ok:
+        verify_result, output = _verify()
+        verified = verify_result == VERIFY_PASS
+        if verify_result == VERIFY_PASS:
             lines.append("命中自身代码 → 校验通过：\n" + output)
+        elif verify_result == VERIFY_SKIP:
+            # 环境不具备 ≠ 代码改坏了。**不回滚** —— 否则打包版里任何对 plugins/**、
+            # core/** 的修改都会被「必然失败」的校验回滚掉，等于把这个能力禁掉了。
+            lines.append("命中自身代码 → **已跳过校验**（改动已保留）：\n" + output)
         else:
             rolled_back = _restore(path, backup)
             lines.append("命中自身代码 → 校验**未通过**，已"
@@ -543,6 +597,7 @@ def _commit(path: Path, new_content: str, old_content: str, action: str):
     _audit({
         "op": action, "path": str(path), "ok": not rolled_back,
         "protected": protected, "verified": verified,
+        "verify_result": verify_result,
         "rolled_back": rolled_back, "backup": str(backup) if backup else "",
         "bytes": len(new_content.encode("utf-8")),
     })
@@ -684,6 +739,24 @@ def _confirm_extensions(cfg: dict) -> set:
     raw = cfg.get("confirm_extensions")
     items = raw if isinstance(raw, list) else DEFAULT_CONFIRM_EXTENSIONS
     return {str(e).lower() for e in items if str(e).strip()}
+
+
+def is_risky_tool(tool_name: str, arguments: dict) -> bool:
+    """本地风险判定（供 PluginManager 过滤/判定用，不发送给模型）。
+
+    只有 open_path 是「条件风险」：目标后缀命中 config.open.confirm_extensions
+    （可执行类）才算风险；普通目录 / 文档返回 False。
+    write_file / edit_file / delete_file 在 manifest.json 里静态声明 risk=high。
+    """
+    if tool_name != "open_path":
+        return False
+    cfg = _open_cfg()
+    target = _resolve_open_target(str((arguments or {}).get("path") or ""))
+    if isinstance(target, str):
+        return False          # 路径解析失败：open_path 自己会返回该错误文本
+    if target.is_dir():
+        return False
+    return target.suffix.lower() in _confirm_extensions(cfg)
 
 
 def _resolve_open_target(raw: str) -> Path | str:

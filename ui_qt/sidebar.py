@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -19,6 +18,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from .themed_dialog import confirm
 
 COMMAND_HELP = """
 - `/model flash|pro` 切换模型
@@ -114,10 +115,12 @@ class _SessionRow(QFrame):
     delete_requested = Signal(str, str)
 
     def __init__(self, file_name: str, title: str, summary: str,
-                 parent: Optional[QWidget] = None) -> None:
+                 current: bool = False, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._file_name = file_name
         self.setProperty("class", "session-row")
+        # 动态属性供 QSS 命中：当前会话要能从列表里一眼认出来
+        self.setProperty("current", "true" if current else "false")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setToolTip(title if not summary else f"{title}\n{summary}")
 
@@ -270,7 +273,8 @@ class Sidebar(QWidget):
         finally:
             self._syncing = False
 
-    def set_sessions(self, sessions: List[dict], max_sessions: int) -> None:
+    def set_sessions(self, sessions: List[dict], max_sessions: int,
+                     current_file: str = "") -> None:
         while self._session_layout.count() > 1:
             item = self._session_layout.takeAt(0)
             widget = item.widget()
@@ -290,17 +294,18 @@ class Sidebar(QWidget):
         self.session_note.setText(f"{len(sessions)}/{max_sessions} 个会话，点 × 删除")
 
         for session in sessions:
-            row = self._make_session_row(session)
+            row = self._make_session_row(session, current_file)
             self._session_layout.insertWidget(self._session_layout.count() - 1, row)
 
-    def _make_session_row(self, session: dict) -> QWidget:
+    def _make_session_row(self, session: dict, current_file: str = "") -> QWidget:
         file_name = session.get("file", "")
         title = (session.get("title") or "无标题").strip() or "无标题"
         for ch in ("*", "_", "#", "`", "|", "[", "]", "~"):
             title = title.replace(ch, "")
         summary = (session.get("summary") or "").strip().replace("\n", " ")
 
-        row = _SessionRow(file_name, title, summary)
+        row = _SessionRow(file_name, title, summary,
+                          current=bool(file_name) and file_name == current_file)
         row.clicked.connect(self.session_open.emit)
         row.delete_requested.connect(self._confirm_delete)
         return row
@@ -338,13 +343,9 @@ class Sidebar(QWidget):
         self.workspace_create.emit(name)
 
     def _on_ws_delete(self) -> None:
-        answer = QMessageBox.question(
-            self, "删除工作空间",
-            "确定删除当前工作空间吗？其历史、记忆、知识库将一并删除，且不可恢复。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
+        if confirm(self, "删除工作空间", "确定删除当前工作空间吗？",
+                   informative="其历史、记忆、知识库将一并删除，且不可恢复。",
+                   ok="删除", danger=True):
             self.workspace_delete.emit()
 
     def _on_role_changed(self, _index: int) -> None:
@@ -353,11 +354,6 @@ class Sidebar(QWidget):
         self.role_change.emit(self.role_combo.currentData() or "")
 
     def _confirm_delete(self, file_name: str, title: str) -> None:
-        answer = QMessageBox.question(
-            self, "删除会话",
-            f"确定删除会话「{title}」吗？删除后不可恢复。",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
+        if confirm(self, "删除会话", f"确定删除会话「{title}」吗？",
+                   informative="删除后不可恢复。", ok="删除", danger=True):
             self.session_delete.emit(file_name)

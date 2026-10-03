@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QWidget
 
 
@@ -17,6 +17,7 @@ class PetInputBar(QWidget):
     collapsed_changed = Signal(bool)
 
     HEIGHT = 34
+    PLACEHOLDER = "和我说点什么…"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -31,7 +32,7 @@ class PetInputBar(QWidget):
 
         self.edit = QLineEdit(self)
         self.edit.setObjectName("petinput-edit")
-        self.edit.setPlaceholderText("和我说点什么…")
+        self.edit.setPlaceholderText(self.PLACEHOLDER)
         self.edit.setClearButtonEnabled(False)
         self.edit.returnPressed.connect(self.submit)
         # 焦点在 QLineEdit 上，本控件收不到它的 FocusIn/FocusOut ——
@@ -47,6 +48,9 @@ class PetInputBar(QWidget):
         layout.addWidget(self.toggle)
 
         self._collapsed = False
+        #: 生成中仍允许打字，只是发不出去（见 set_enabled_input）
+        self._can_send = True
+        self._flash_timer: QTimer | None = None
 
     # ── 折叠 ──
 
@@ -73,6 +77,10 @@ class PetInputBar(QWidget):
         text = self.edit.text().strip()
         if not text:
             return
+        if not self._can_send:
+            # 输入框在生成中仍可编辑，所以必须给反馈，不能静默吞掉
+            self._flash_placeholder("正在生成中…")
+            return
         self.edit.clear()
         self.send_requested.emit(text)
 
@@ -82,9 +90,26 @@ class PetInputBar(QWidget):
         self.edit.setFocus()
 
     def set_enabled_input(self, enabled: bool) -> None:
-        """生成中禁用发送，避免重复提交（引擎同一时刻只跑一次）。"""
-        self.edit.setEnabled(enabled)
+        """生成中**仍可打字**，只是发不出去（与主窗口输入框一致的手感）。
+
+        以前这里直接 `setEnabled(False)` 把整个输入框禁掉，长回复期间连改字
+        都做不到 —— 和主窗口的 `setReadOnly(True)` 是同一个反体验。
+        """
+        self._can_send = bool(enabled)
         self.toggle.setEnabled(True)
+
+    def _flash_placeholder(self, text: str) -> None:
+        """临时换掉 placeholder 当反馈，1.5 秒后恢复。
+
+        这条输入条没有状态行可用，placeholder 是唯一不占额外空间的提示位。
+        """
+        if self._flash_timer is None:
+            self._flash_timer = QTimer(self)
+            self._flash_timer.setSingleShot(True)
+            self._flash_timer.timeout.connect(
+                lambda: self.edit.setPlaceholderText(self.PLACEHOLDER))
+        self.edit.setPlaceholderText(text)
+        self._flash_timer.start(1500)
 
     # ── 闲时半透明 / 活跃变实 ──
 

@@ -10,6 +10,16 @@
     dist/meido-debug/meido-debug.exe （排障：同样的 onedir，但保留控制台，§7.3）
     config/ plugins/ workspaces/ assets/ roles/ skills/ data/ 一律**外置**在 exe 同级（§7.4）
 
+图标：
+    取 `assets/app.ico`（由 `tools/make_app_icon.py` 从静态立绘裁出，内嵌 16~256 七档）。
+    文件缺失时只是没有自定义图标，**不会**让打包失败。
+
+两条启动路径的分工（2026-10-03）：
+    exe          无头 —— 双击无控制台，日常使用
+    启动妹抖酱.bat 有头 —— 在当前控制台里跑 `python main.py`，那个窗口就是实时
+                  调试窗口（日志 + print）。**不要**为了这个去开
+                  `[logging] show_console`：那会连 exe 一起变成有控制台。
+
 关键点：
 1. onedir（不用 --onefile）、无控制台（console=False）
 2. 插件是动态 import，第三方依赖必须显式写进 hiddenimports（§7.5 / R2）
@@ -56,6 +66,14 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 WITH_CONSOLE = os.environ.get("MEIDO_CONSOLE") == "1"
 APP_NAME = "meido-debug" if WITH_CONSOLE else "meido"
 
+# ── exe 图标 ──
+# assets/app.ico 由 tools/make_app_icon.py 从静态立绘裁出（内嵌 16~256 七档尺寸）。
+# 文件缺失时不报错、只是没有图标 —— 不该因为一个图标让整次打包失败。
+ICON_PATH = os.path.join(PROJECT_ROOT, "assets", "app.ico")
+if not os.path.exists(ICON_PATH):
+    print(f"[meido.spec] 未找到图标 {ICON_PATH}，本次打包将不带自定义图标")
+    ICON_PATH = None
+
 # ── 插件/引擎的第三方依赖（动态 import，静态分析看不到） ──
 hiddenimports = [
     "openai", "httpx", "httpcore", "anyio", "sniffio", "distro", "jiter", "tqdm",
@@ -88,6 +106,21 @@ hiddenimports += _h
 
 # lxml（BeautifulSoup 解析器）
 hiddenimports += collect_submodules("lxml")
+
+# MCP 客户端（plugins/mcp_client）。`from mcp import ClientSession` 写在函数体里
+# （懒加载），静态分析**看不到** → 必须显式收集。
+# ⚠️ 漏了的表现：启动日志里一行「[mcp_client] server [...] 不可用：缺少 mcp 依赖」，
+# 所有 MCP server 都用不了 —— 打包版尤其容易漏，因为开发机上通常已经装好了。
+_d, _b, _h = collect_all("mcp")
+datas += _d
+binaries += _b
+hiddenimports += _h
+# mcp 的部分依赖是**懒加载**的（HTTP/SSE 那条链路），静态分析同样抓不到，显式补上。
+hiddenimports += [
+    "pydantic", "pydantic_settings", "pydantic_core", "anyio", "httpx", "httpx_sse",
+    "jsonschema", "jsonschema_specifications", "referencing", "rpds",
+    "jwt", "sse_starlette", "starlette", "uvicorn", "python_multipart",
+]
 
 # Qt 图像格式插件：webp/jpeg/gif 必须打包（§7.5）
 datas += collect_data_files("PySide6", includes=["plugins/imageformats/*"])
@@ -142,6 +175,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name=APP_NAME,
+    icon=ICON_PATH,         # 见上方 ICON_PATH；None 时 PyInstaller 用默认图标
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

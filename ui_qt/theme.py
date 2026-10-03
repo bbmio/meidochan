@@ -545,6 +545,10 @@ QPushButton#primary:hover {{
     background: {t['accent-hover']}; color: {t['on-solid']};
     border-color: {t['accent-hover']};
 }}
+QPushButton#danger {{
+    background: {t['bg']}; color: {t['danger-text']};
+    border: 1px solid {t['border']};
+}}
 QPushButton#danger:hover {{
     background: {t['danger-soft']}; color: {t['danger-text']};
     border-color: {t['danger-text']};
@@ -587,6 +591,11 @@ QPushButton#pinbtn:checked {{ background: {t['accent-soft']}; color: {t['accent-
 QFrame[class="session-row"] {{
     background: transparent; border: 1px solid transparent; border-radius: {r_md}px;
 }}
+/* 当前会话：必须排在 :hover 之前 —— 两者特异性相同，靠先后顺序决定胜负，
+   这样悬停在当前会话上时仍然有 hover 反馈，不会变成"点不动"的观感。 */
+QFrame[class="session-row"][current="true"] {{
+    background: {t['accent-soft']}; border-color: {t['accent']};
+}}
 QFrame[class="session-row"]:hover {{
     background: {t['surface-hover']}; border-color: {t['border']};
 }}
@@ -597,6 +606,15 @@ QStatusBar {{ background: {t['surface']}; border-top: 1px solid {t['border']};
     border-bottom-left-radius: {r_xl}px; border-bottom-right-radius: {r_xl}px; }}
 QStatusBar::item {{ border: none; }}
 QDialog {{ background: {t['bg']}; }}
+
+/* ── 主题化对话框（ui_qt/themed_dialog.py）──
+   ⚠️ 这里**刻意不写 background / border / border-radius**：那个窗口设了
+   WA_TranslucentBackground，Qt 会跳过 paintBackground，QSS 的背景**根本画不出来**
+   （实测整个弹窗 alpha=0）。背景与圆角由 ThemedMessageBox.paintEvent 自绘，
+   取的还是同一套令牌，所以换肤依旧跟着走。这里只放子控件的样式。 */
+QMessageBox#themedbox QLabel {{ color: {t['text']}; }}
+QMessageBox#themedbox QLabel#qt_msgbox_informativelabel {{ color: {t['muted']}; }}
+QMessageBox#themedbox QPushButton {{ min-width: 84px; }}
 QTabWidget::pane {{ border: 1px solid {t['border']}; border-radius: {r_md}px; }}
 QTabBar::tab {{
     padding: 6px 14px; border: 1px solid {t['border']}; border-bottom: none;

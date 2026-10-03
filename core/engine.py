@@ -18,6 +18,10 @@ from workspace.manager import WorkspaceManager
 
 MAX_INPUT_LENGTH = 8000
 
+# 风险工具被总开关拦下时的统一提示（只拦 AI 自动调用；用户手输命令不走这里）
+RISKY_TOOLS_DISABLED_MSG = (
+    "风险工具调用已关闭。若确实需要，请到「设置 → 插件」开启「允许 AI 自动调用高风险工具」。")
+
 
 def _clean_xml_tags(text: str) -> str:
     text = re.sub(r"<invoke_tool_calls>.*?</invoke_tool_calls>", "", text, flags=re.DOTALL)
@@ -45,6 +49,10 @@ class WhaleGirlEngine:
     def __init__(self, config_dir: str | None = None):
         # 当前对话阶段（由 brain 上报，UI 侧的表情靠它驱动，不再从展示文本反推）
         self.current_phase = "idle"
+        # 最近一次**主对话** API 调用的 token 用量快照（状态栏的缓存命中率读它）。
+        # 与 current_phase 同一套路：brain 上报事件 → 这里存下来 → worker 用 getattr 读走。
+        # None = 还没有过调用；hit/miss 为 None = 该服务商不返回缓存字段（本地模型）。
+        self.last_usage: Optional[dict] = None
         # 相对路径一律按 APP_DIR 解析（打包后 = exe 同级目录，见 §4.2）
         config_dir = str(app_path("config")) if config_dir is None else config_dir
         self.config = ConfigLoader(config_dir)
@@ -111,11 +119,15 @@ class WhaleGirlEngine:
         self.context_engine.set_workspace_persona(ws.persona_prompt)
 
     def switch_workspace(self, workspace_id: str) -> str:
-        """切换工作空间并重新绑定引擎组件"""
+        """切换工作空间并重新绑定引擎组件。
+
+        切换前必须把当前空间的概览卡同步落盘：写盘失败时拒绝切换 ——
+        否则未落盘的记忆会被新空间的卡片文件顶掉。
+        """
+        from core.memory import profile_cards
+        if not profile_cards.flush_to_disk():
+            return " 概览卡保存失败，已取消切换工作空间（请检查数据目录权限后重试）。"
         try:
-            # 会话结束：先落盘当前空间概览卡，再切换
-            from core.memory import profile_cards
-            profile_cards.flush_to_disk()
             ws = self.workspace_mgr.switch(workspace_id)
             self._bind_workspace()
             return f" 已切换到工作空间: [{ws.id}] {ws.name}"
@@ -123,9 +135,13 @@ class WhaleGirlEngine:
             return f" {e}"
 
     def new_session(self) -> str:
-        """新会话：先固化概览卡（会话结束强制抽取+写盘），再开新会话。"""
+        """新会话：先固化概览卡（强制抽取 + 同步写盘），再开新会话。
+
+        写盘失败时不开新会话 —— 磁盘上还没有最新记忆，清空上下文等于丢失。
+        """
         from core.memory import profile_cards
-        profile_cards.finalize_session(self.history.load_api_state())
+        if not profile_cards.finalize_session(self.history.load_api_state()):
+            return " 概览卡保存失败，未创建新会话（请检查数据目录权限后重试）。"
         return self.history.new_session()
 
     def create_workspace(self, name: str, persona_prompt: str = "") -> str:
@@ -335,20 +351,56 @@ class WhaleGirlEngine:
             arg = ""
         return self._execute_command(cmd, arg) or f" 已执行 {tool_name}"
 
+    def _allow_risky_tools(self) -> bool:
+        """是否允许 AI 自动调用高风险工具；读取失败按关闭处理（fail-closed）。"""
+        try:
+            return bool(self.config.get_plugins_config().allow_risky_tools)
+        except Exception as exc:
+            print(f"  [安全] 读取风险工具开关失败，已按关闭处理: {exc}")
+            return False
+
+    def _plugin_tools_for_model(self) -> List[dict]:
+        """给模型的插件工具定义。策略实时读取：保存开关后下一次对话即生效，不重启插件。"""
+        return self.plugin_manager.get_tool_definitions(
+            allow_risky_tools=self._allow_risky_tools())
+
     def tool_executor(self, tool_name: str, arguments: dict) -> str:
+        # 风险工具硬门：开关关闭时，模型发起的风险调用一律不执行。
+        # 只拦「AI 自动调用」——用户手输命令走 _execute_command，不受此开关约束（已确认的产品语义）。
+        if not self._allow_risky_tools() and self.plugin_manager.is_tool_risky(tool_name, arguments):
+            return RISKY_TOOLS_DISABLED_MSG
         builtin_names = {t["function"]["name"] for t in BUILTIN_TOOLS}
         if tool_name in builtin_names:
             return self.builtin_executor(tool_name, arguments)
         return self.plugin_manager.execute_tool(tool_name, arguments)
 
     def _build_system_prompt(self) -> str:
-        """构建分层 system prompt（人设/概览卡/角色/pins + 自我认知），供 respond / respond_once 复用。"""
-        from core.memory import profile_cards
-        profile_text = profile_cards.get_profile_prompt()
-        ctx_prompt = self.context_engine.build_system_prompt(profile_cards=profile_text)
+        """构建 system prompt 的**静态**部分（人设/角色/pins + 自我认知）。
+
+        ⚠️ 概览卡**不在这里**。它随对话演进，属于动态内容 —— 放进 system prompt 会让
+        它之后的全部前缀（自我认知 4000+ 字符 + 工具定义 6000+ 字符 + 整个对话历史）
+        跟着一起失效。现在它由 `_build_profile_context()` 作为**尾部消息**注入，
+        与历史检索片段同一套做法（见 `respond()`）。
+        """
+        ctx_prompt = self.context_engine.build_system_prompt()
         from core.self_knowledge import build_self_knowledge_prompt, build_memory_prompt
-        ctx_prompt = ctx_prompt + "\n" + build_self_knowledge_prompt(self.plugin_manager, build_memory_prompt())
-        return ctx_prompt
+        return ctx_prompt + "\n" + build_self_knowledge_prompt(
+            self.plugin_manager, build_memory_prompt(),
+            allow_risky_tools=self._allow_risky_tools())
+
+    @staticmethod
+    def _build_profile_context() -> str:
+        """概览卡文本，供**尾部消息**注入；无卡片时返回空串。
+
+        位置是刻意的：prompt cache 的失效边界在「第一个被改动的 token」处，
+        动态内容越靠后，作废的字符越少。实测概览卡只有 100+ 字符，但原先坐在
+        system prompt 第 5 个位置，一改就作废其后 10,000+ 字符。
+        """
+        from core.memory import profile_cards
+        text = profile_cards.get_profile_prompt()
+        if not text:
+            return ""
+        return "（系统注入的对话对象档案，供你参考，不是用户的新指令。）\n" + text
 
     def delete_session(self, file_path: str) -> str:
         """删除历史会话（含向量片段），返回状态文本"""
@@ -404,8 +456,13 @@ class WhaleGirlEngine:
         turn_stamp = now_stamp()
         api_state.append({"role": "user", "content": user_msg, "time": turn_stamp})
 
-        # 构建分层 system prompt（人设/概览卡/角色/pins + 自我认知）
+        # 构建 system prompt（**静态**部分：人设/角色/pins + 自我认知）
         ctx_prompt = self._build_system_prompt()
+
+        # 动态内容一律作为独立消息追加到**末尾**，不拼进 system prompt。
+        # 顺序按「变动频率」排：概览卡（每 4 轮）在前，历史检索（每轮都变）在后 ——
+        # 越稳的越靠前，prompt cache 的失效边界就越靠后。
+        profile_ctx = self._build_profile_context()
 
         # 上下文感知多轮检索历史片段（作为独立消息注入，不拼进 system prompt）
         retrieval_ctx = ""
@@ -424,15 +481,17 @@ class WhaleGirlEngine:
         full_reply = ""
         full_reasoning = ""
         try:
-            # 用副本承载临时注入（system + 历史检索片段），避免污染持久化的 api_state
+            # 用副本承载临时注入（概览卡 + 历史检索片段），避免污染持久化的 api_state
             chat_messages = list(api_state)
+            if profile_ctx:
+                chat_messages.append({"role": "user", "content": profile_ctx})
             if retrieval_ctx:
                 chat_messages.append({"role": "user", "content": retrieval_ctx})
             event_iter = self.brain.chat_stream(
                 chat_messages,
                 self.tool_executor,
                 system_prompt=ctx_prompt,
-                plugin_tools=self.plugin_manager.get_tool_definitions(),
+                plugin_tools=self._plugin_tools_for_model(),
             )
         except RuntimeError as e:
             # API Key 未配置等情况
@@ -480,6 +539,22 @@ class WhaleGirlEngine:
                 full_reply = _clean_xml_tags(full_reply)
                 if event.get("reasoning") and not full_reasoning:
                     full_reasoning = event["reasoning"]
+            elif event["type"] == "tool_messages":
+                # 工具交互落进**持久化**状态。
+                #
+                # 不接这一手的话，工具结果只活在本轮 `chat_messages` 那个临时副本里，
+                # 下一轮模型完全看不到 —— 实测它会自己发现「我上下文里没留着之前
+                # 那次列目录的记录」，然后**重新调一次同样的工具**。
+                #
+                # 存的是「模型视角」的消息（assistant 带 tool_calls + tool 结果），
+                # **不含**概览卡与历史检索片段那两个临时注入：它们每轮重算，
+                # 写进历史会既污染上下文又白占 token。
+                api_state.extend(event["messages"])
+            elif event["type"] == "usage":
+                # 主对话的 token 用量（含缓存命中数），状态栏读它。
+                # 不在这里 yield 出去：respond() 的 yield 是 (文本, 历史, 状态) 三元组，
+                # 改形状会把 bridge 打坏 —— 与 current_phase 一样走实例属性。
+                self.last_usage = event["usage"]
 
         if not full_reply:
             has_tool = any(m.get("role") == "tool" for m in api_state)
@@ -535,7 +610,7 @@ class WhaleGirlEngine:
                 messages,
                 self.tool_executor,
                 system_prompt=ctx_prompt,
-                plugin_tools=self.plugin_manager.get_tool_definitions(),
+                plugin_tools=self._plugin_tools_for_model(),
             )
             for event in event_iter:
                 if event["type"] == "text":

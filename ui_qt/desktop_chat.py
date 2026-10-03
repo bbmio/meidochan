@@ -155,6 +155,8 @@ class DesktopChatWindow(QWidget):
 
     def submit(self) -> None:
         if self._busy:
+            # 与主窗口一致：生成中仍可打字，但发送要给反馈而不是静默吞掉
+            self.set_status("正在生成中，等这条回复结束后再发送")
             return
         text = self.input.toPlainText().strip()
         if not text:
