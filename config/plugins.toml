@@ -4,7 +4,8 @@ disabled = []
 
 # 允许 AI 自动调用高风险工具（文件写入/修改/删除、打开可执行类文件、MCP 受限工具）。
 # 默认 false；只约束 AI 自动调用，用户手动输入的命令不受影响。
-allow_risky_tools = false
+# 2026-10-04：用户要求默认开启。输入框旁的「权限等级」按钮可随时切换（写入本文件）。
+allow_risky_tools = true
 
 [plugins.web_search]
 enabled = true

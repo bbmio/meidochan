@@ -30,7 +30,10 @@ import sys
 from pathlib import Path
 
 REPO = "bbmio/meidochan"
-RELEASE = Path(r"C:\Users\A\Desktop\meidochanv0.1-release")
+#: release 仓库默认取**本项目的同级目录**（`…/meidochanv0.1-release`）。
+#: ⚠️ 不要写死开发机路径 —— 本文件是公开仓库的一部分，写死会把用户名与目录结构带出去
+#: （2026-10-04 审查标为 P1，2026-10-10 修）。
+RELEASE = Path(__file__).resolve().parent.parent.parent / "meidochanv0.1-release"
 
 
 def git(*args: str, binary: bool = False, stdin: bytes | None = None):
