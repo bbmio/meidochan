@@ -514,6 +514,8 @@ class ChatView(QWidget):
     history_load_requested = Signal(int)
     new_session_requested = Signal()
     export_requested = Signal(str)
+    #: 用户点了「权限等级」按钮，请求把高风险工具总开关设为该值
+    risk_policy_changed = Signal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -527,6 +529,7 @@ class ChatView(QWidget):
         self._startup_locked = False
         self._stick_bottom = True
         self._last_flow: Optional[tuple] = None
+        self._risk_enabled = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 10, 16, 10)
@@ -586,6 +589,14 @@ class ChatView(QWidget):
         self.input.submitted.connect(self._on_submit)
         self.input.escaped.connect(self._on_stop)
         input_row.addWidget(self.input, 1)
+
+        # 权限等级：高风险工具总开关（省得每次去设置里翻）。
+        # 按钮只负责「请求」，真正的持久化与状态回读由 MainWindow 负责。
+        self.risk_btn = QPushButton("🔒 普通")
+        self.risk_btn.setProperty("class", "tight")
+        self.risk_btn.clicked.connect(self._toggle_risk_policy)
+        input_row.addWidget(self.risk_btn)
+        self.set_risk_policy(False)
 
         self.attach_btn = QPushButton("附件")
         self.attach_btn.setToolTip("插入要处理的文件路径（配合 /view、/info 等命令）")
@@ -866,6 +877,35 @@ class ChatView(QWidget):
             prefix = "" if self.input.toPlainText().endswith((" ", "\n")) else " "
             self.input.insertPlainText(
                 f"{prefix}{path}" if self.input.toPlainText() else path)
+
+    # ── 权限等级（高风险工具总开关）──
+
+    def _toggle_risk_policy(self) -> None:
+        """按钮点击：只发请求，真正的保存由 MainWindow 做。"""
+        self.risk_policy_changed.emit(not self._risk_enabled)
+
+    def set_risk_policy(self, enabled: bool) -> None:
+        """把按钮显示同步到指定权限等级（不写配置）。"""
+        self._risk_enabled = bool(enabled)
+        if self._risk_enabled:
+            self.risk_btn.setText("⚠ 高风险")
+            self.risk_btn.setObjectName("danger")
+            self.risk_btn.setToolTip(
+                "高风险工具已启用：AI 可自动写/删文件、调用受限 MCP 工具等。\n"
+                "点击降为「普通」。")
+        else:
+            self.risk_btn.setText("🔒 普通")
+            self.risk_btn.setObjectName("")
+            self.risk_btn.setToolTip(
+                "高风险工具已禁用：AI 不会自动写/删文件或调用受限工具。\n"
+                "点击升为「高风险」。")
+        # objectName 变了 Qt 不会自动重算样式表，必须 unpolish/polish 一次
+        self.risk_btn.style().unpolish(self.risk_btn)
+        self.risk_btn.style().polish(self.risk_btn)
+
+    def risk_policy(self) -> bool:
+        """当前按钮显示的权限等级。"""
+        return self._risk_enabled
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)

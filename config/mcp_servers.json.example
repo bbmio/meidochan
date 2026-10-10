@@ -1,0 +1,11 @@
+{
+    "mcpServers": {
+        "utools": {
+            "type": "http",
+            "url": "http://127.0.0.1:3501/mcp",
+            "headers": {
+                "x-mcp-key": "在此填入你的密钥"
+            }
+        }
+    }
+}

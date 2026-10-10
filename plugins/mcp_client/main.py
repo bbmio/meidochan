@@ -1,10 +1,11 @@
-"""MCP 客户端插件：连接外部 MCP server（stdio），把它们的工具动态注册给 AI。
+"""MCP 客户端插件：连接外部 MCP server（stdio / Streamable HTTP / SSE），
+把它们的工具动态注册给 AI。
 
 设计要点
 --------
 1. **异步桥接**：MCP SDK 是 asyncio 的，而插件的 execute_tool 是同步的。
    这里用一条后台线程跑常驻事件循环，把异步调用包成同步接口。
-2. **会话归属**：MCP 的 stdio_client / ClientSession 必须在**同一个任务**里进出，
+2. **会话归属**：MCP 的传输客户端 / ClientSession 必须在**同一个任务**里进出，
    所以每个 server 由一个常驻协程持有会话，外部调用通过 asyncio.Queue 投递进去
    串行执行（AI 本来就是顺序调用工具，串行没有损失）。
 3. **非阻塞启动**：server 在后台线程启动（npx 首次拉包实测约 40s），
@@ -12,12 +13,19 @@
 4. **命名空间**：工具名统一加 `<server>__` 前缀，避免与现有插件工具重名。
 5. **受限工具**：config/mcp.toml 的 disabled_tools 默认不暴露；
    妹抖酱需先用 mcp_tool_access 向用户申请，用户同意后授权，下次对话即生效。
+6. **传输类型**（`[[servers]]` 的 `type` 字段，默认 `stdio`）：
+   - `stdio`：`command` + `args`（本地进程，走 stdin/stdout）
+   - `http` ：Streamable HTTP，`url` + 可选 `headers`
+   - `sse`  ：旧式 SSE，`url` + 可选 `headers`
+   另外可放一份**标准 `mcpServers` 格式**的 `config/mcp_servers.json`
+   （Claude Desktop / Cursor 那种 JSON），其条目会与 mcp.toml 合并。
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -32,9 +40,13 @@ except ImportError:         # pragma: no cover - 项目要求 3.11+，这里只�
 
 PLUGIN_DIR = Path(__file__).parent
 CONFIG_PARTS = ("config", "mcp.toml")
+JSON_CONFIG_PARTS = ("config", "mcp_servers.json")
 DEFAULT_GRANTS_PARTS = ("data", "mcp_grants.json")
 NAME_SEP = "__"
 MAX_DESCRIPTION = 1024
+
+#: `type` 的别名 → 归一化后的传输名
+_HTTP_ALIASES = {"http", "streamable-http", "streamable_http", "streamablehttp"}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -60,6 +72,155 @@ def _load_config() -> dict:
     except Exception as exc:
         print(f" [mcp_client] config/mcp.toml 解析失败，按未启用处理：{exc}")
         return {}
+
+
+def _load_json_raw() -> dict:
+    """读取 config/mcp_servers.json 的 `mcpServers` 对象（name → spec）。
+
+    文件不存在 / 解析失败 / 结构不对一律返回空 dict（不致命）。
+    """
+    path = app_path(*JSON_CONFIG_PARTS)
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        print(f" [mcp_client] config/mcp_servers.json 解析失败，忽略：{exc}")
+        return {}
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        print(" [mcp_client] config/mcp_servers.json 缺少 mcpServers 对象，忽略")
+        return {}
+    return {str(k): v for k, v in servers.items() if isinstance(v, dict)}
+
+
+def _load_json_servers() -> List[dict]:
+    """把 mcp_servers.json 的条目转成与 mcp.toml `[[servers]]` 一致的结构。
+
+    形如（Claude Desktop / Cursor 的通用格式）：
+        {"mcpServers": {
+            "utools": {"type": "http",
+                       "url": "http://127.0.0.1:3501/mcp",
+                       "headers": {"x-mcp-key": "..."}}}}
+    每个条目转成与 mcp.toml `[[servers]]` 一致的结构（name 取自 key）。
+    """
+    out: List[dict] = []
+    for name, spec in _load_json_raw().items():
+        entry = dict(spec)
+        entry["name"] = name
+        out.append(entry)
+    return out
+
+
+def _save_json_servers(servers: dict) -> Path:
+    """把 `mcpServers` 写回 config/mcp_servers.json（**原子写 + 先备份**）。
+
+    ⚠️ 只写这个 JSON —— **绝不碰 mcp.toml**：TOML 是用户手写的，程序重写会
+    丢掉所有注释与排版（tomllib 只读，没有保注释的写回方案）。
+    """
+    path = app_path(*JSON_CONFIG_PARTS)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            shutil.copyfile(path, path.with_name(path.name + ".bak"))
+        except OSError as exc:
+            print(f" [mcp_client] 备份 mcp_servers.json 失败（继续写）：{exc}")
+    tmp = path.with_name(path.name + ".tmp")
+    text = json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=4) + "\n"
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)                 # 原子替换，避免写一半被读到
+    return path
+
+
+def _server_sources(cfg: dict) -> Dict[str, str]:
+    """每个 server 来自哪个文件（`toml` / `json`）。
+
+    用于提示「同名时 TOML 遮蔽 JSON」——往 JSON 里加了个与 TOML 同名的 server
+    却看到旧配置，就是踩了这个。
+    """
+    out: Dict[str, str] = {}
+    for entry in (cfg.get("servers") or []):
+        if isinstance(entry, dict) and entry.get("name"):
+            out[str(entry["name"]).strip()] = "toml"
+    for name in _load_json_raw():
+        out.setdefault(name, "json")
+    return out
+
+
+def _server_entries(cfg: dict) -> List[dict]:
+    """合并 mcp.toml 的 `[[servers]]` 与 mcp_servers.json 的条目。
+
+    同名时**以 mcp.toml 为准**（TOML 是主配置，JSON 方便直接粘贴）。
+    """
+    entries: List[dict] = [e for e in (cfg.get("servers") or []) if isinstance(e, dict)]
+    seen = {str(e.get("name") or "").strip() for e in entries}
+    for entry in _load_json_servers():
+        if str(entry.get("name") or "").strip() in seen:
+            continue
+        entries.append(entry)
+    return entries
+
+
+def _safe_file_part(name: str) -> str:
+    """把 server 名压成安全的文件名片段（防目录穿越 / 非法字符）。"""
+    keep = [ch if (ch.isalnum() or ch in "-_") else "_" for ch in str(name)]
+    return "".join(keep).strip("_") or "server"
+
+
+def _flatten_exceptions(exc: BaseException) -> List[BaseException]:
+    """递归展开 `ExceptionGroup` / `BaseExceptionGroup`，取到最内层的真实异常。"""
+    subs = getattr(exc, "exceptions", None)
+    if not subs:
+        return [exc]
+    out: List[BaseException] = []
+    for sub in subs:
+        out.extend(_flatten_exceptions(sub))
+    return out
+
+
+def _describe_exception(exc: BaseException) -> str:
+    """把异常渲染成**露出根因**的可读文本。
+
+    ⚠️ 为什么需要这个：MCP SDK 的传输层跑在 anyio 的 `TaskGroup` 里，一旦握手/请求
+    失败，抛出来的是 `ExceptionGroup`，而 `str(ExceptionGroup)` 只会给出
+    `"unhandled errors in a TaskGroup (1 sub-exception)"` —— **真正的原因被包在里面**，
+    日志和 `mcp_status` 里全都看不到。实测踩到过：真实根因是
+    `McpError: Method not found`（uTools 未实现 tools/list），但外面只看得到那句废话。
+    这里把嵌套结构展开，逐条列出最内层异常。
+    """
+    leaves = _flatten_exceptions(exc)
+    head = f"{type(exc).__name__}: {exc}"
+    if len(leaves) == 1 and leaves[0] is exc:
+        return head
+
+    parts = [head]
+    seen = set()
+    for leaf in leaves:
+        text = f"{type(leaf).__name__}: {leaf}"
+        if text == head or text in seen:
+            continue
+        seen.add(text)
+        parts.append(f"  ↳ {text}")
+    return "\n".join(parts)
+
+
+def _open_errlog(name: str):
+    """给 stdio server 的子进程 stderr 一个**真文件句柄**。
+
+    背景：mcp 的 `stdio_client` 默认把 `sys.stderr` 当子进程 stderr
+    （`errlog: TextIO = sys.stderr`），而无控制台运行时 `sys.stderr` 是
+    `core.logging_utils._LogStream` —— 它的 `fileno()` 抛 OSError，
+    于是子进程创建阶段就报「OSError: 日志流没有文件描述符」，server 永远起不来。
+    这里显式指向 data/logs 下的文件：既绕开无 fd 的流，又保住 server 的诊断输出。
+    """
+    try:
+        path = app_path("data", "logs", f"mcp_{_safe_file_part(name)}_stderr.log")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return open(path, "ab")          # 二进制追加：交给子进程直接写字节
+    except OSError:
+        # 连日志文件都开不了时退化为丢弃；但绝不能返回无 fd 的流（否则又崩）
+        return open(os.devnull, "wb")
 
 
 def _grants_path() -> Path:
@@ -116,7 +277,7 @@ class _Loop:
 class _Server:
     """一个 MCP server 的常驻会话。
 
-    会话由 `_serve()` 这一个常驻协程持有（MCP 的 stdio_client / ClientSession
+    会话由 `_serve()` 这一个常驻协程持有（MCP 的传输客户端 / ClientSession
     必须在同一任务里进出），外部调用通过 asyncio.Queue 投递进来串行执行。
     """
 
@@ -129,6 +290,7 @@ class _Server:
         self._queue: Optional[asyncio.Queue] = None
         self._stop: Optional[asyncio.Event] = None
         self._ready = threading.Event()
+        self._done = threading.Event()       # 常驻协程收尾（stop 之后等它）
 
     # ── 生命周期 ──
 
@@ -145,13 +307,48 @@ class _Server:
             except Exception:
                 pass
 
+    def wait_closed(self, timeout: float) -> bool:
+        """等常驻协程收尾（应在 `stop()` 之后调用）。
+
+        协程退出时 `async with` 会依次关掉传输上下文 —— stdio 的子进程、
+        HTTP 的连接都随之释放。等它，是为了重载时**不泄漏旧进程**。
+        """
+        return self._done.wait(timeout)
+
+    def transport(self) -> str:
+        """归一化传输类型：`stdio` / `http` / `sse`（无法识别时按 stdio）。"""
+        raw = str(self.cfg.get("type") or "stdio").strip().lower()
+        if raw in _HTTP_ALIASES:
+            return "http"
+        if raw == "sse":
+            return "sse"
+        return "stdio"
+
     async def _serve(self) -> None:
+        self._queue = asyncio.Queue()
+        self._stop = asyncio.Event()
+        try:
+            kind = self.transport()
+            if kind == "http":
+                await self._serve_http()
+            elif kind == "sse":
+                await self._serve_sse()
+            else:
+                await self._serve_stdio()
+        except Exception as exc:
+            self.error = _describe_exception(exc)
+        finally:
+            self._ready.set()
+            self._done.set()
+
+    # ── 各传输 ──
+
+    async def _serve_stdio(self) -> None:
         try:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
         except ImportError as exc:
             self.error = f"缺少 mcp 依赖（pip install mcp）：{exc}"
-            self._ready.set()
             return
 
         env = dict(os.environ)
@@ -166,21 +363,72 @@ class _Server:
             cwd=str(APP_DIR),
         )
 
-        self._queue = asyncio.Queue()
-        self._stop = asyncio.Event()
+        # ⚠️ 必须显式传 errlog：`stdio_client` 的默认值是 `sys.stderr`，
+        # 而无控制台运行时它是 `_LogStream`（没有真 fd）→ 子进程创建时
+        # `.fileno()` 抛 OSError「日志流没有文件描述符」，server 永远起不来。
+        errlog = _open_errlog(self.name)
         try:
-            async with stdio_client(params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    listed = await session.list_tools()
-                    self.tools = list(listed.tools)
-                    self.error = None
-                    self._ready.set()
-                    await self._pump(session)
-        except Exception as exc:
-            self.error = f"{type(exc).__name__}: {exc}"
+            async with stdio_client(params, errlog=errlog) as (read, write):
+                await self._session_loop(ClientSession, read, write)
         finally:
+            try:
+                errlog.close()
+            except Exception:
+                pass
+
+    async def _serve_http(self) -> None:
+        """Streamable HTTP 传输（url + headers）。"""
+        url = str(self.cfg.get("url") or "").strip()
+        if not url:
+            self.error = "type=http 但没有配置 url"
+            return
+        try:
+            import httpx
+            from mcp import ClientSession
+            from mcp.client.streamable_http import streamable_http_client
+        except ImportError as exc:
+            self.error = f"缺少 mcp/http 依赖：{exc}"
+            return
+
+        headers = {str(k): str(v) for k, v in (self.cfg.get("headers") or {}).items()}
+        timeout = float((_load_config().get("settings") or {}).get("http_timeout", 30) or 30)
+        # SDK 新版要求自行传入 httpx.AsyncClient 才能配 headers（旧的
+        # streamablehttp_client(url, headers=...) 已 deprecated）。
+        client = httpx.AsyncClient(
+            headers=headers or None,
+            timeout=httpx.Timeout(timeout, read=300.0),
+            follow_redirects=True,
+        )
+        async with client:
+            async with streamable_http_client(url, http_client=client) as (read, write, _sid):
+                await self._session_loop(ClientSession, read, write)
+
+    async def _serve_sse(self) -> None:
+        """旧式 SSE 传输（url + headers）。"""
+        url = str(self.cfg.get("url") or "").strip()
+        if not url:
+            self.error = "type=sse 但没有配置 url"
+            return
+        try:
+            from mcp import ClientSession
+            from mcp.client.sse import sse_client
+        except ImportError as exc:
+            self.error = f"缺少 mcp 依赖：{exc}"
+            return
+
+        headers = {str(k): str(v) for k, v in (self.cfg.get("headers") or {}).items()}
+        async with sse_client(url, headers=headers or None) as (read, write):
+            await self._session_loop(ClientSession, read, write)
+
+    async def _session_loop(self, session_cls, read, write) -> None:
+        """握手 → 列出工具 → 进入常驻循环。三种传输共用。"""
+        async with session_cls(read, write) as session:
+            await session.initialize()
+            listed = await session.list_tools()
+            self.tools = list(listed.tools)
+            self.error = None
             self._ready.set()
+            await self._pump(session)
 
     async def _pump(self, session) -> None:
         """常驻循环：从队列取请求 → 调 MCP → 回填 future。"""
@@ -236,8 +484,8 @@ def _bootstrap() -> None:
 
     _LOOP = _Loop()
     timeout = float(settings.get("startup_timeout", 120) or 120)
-    for entry in (cfg.get("servers") or []):
-        if not isinstance(entry, dict) or not entry.get("enabled", True):
+    for entry in _server_entries(cfg):
+        if not entry.get("enabled", True):
             continue
         name = str(entry.get("name") or "").strip()
         if not name:
@@ -247,9 +495,10 @@ def _bootstrap() -> None:
         try:
             server.start(timeout)
         except Exception as exc:
-            server.error = f"{type(exc).__name__}: {exc}"
+            server.error = _describe_exception(exc)
         if server.tools:
-            print(f" [mcp_client] server [{name}] 就绪，工具 {len(server.tools)} 个")
+            print(f" [mcp_client] server [{name}] 就绪（{server.transport()}），"
+                  f"工具 {len(server.tools)} 个")
         else:
             print(f" [mcp_client] server [{name}] 不可用：{server.error}")
     _BOOTSTRAP_DONE.set()
@@ -263,6 +512,85 @@ def _ensure_bootstrap() -> None:
             return
         _BOOTSTRAP_STARTED = True
     threading.Thread(target=_bootstrap, daemon=True).start()
+
+
+#: 重载时单个 server 的握手等待上限（秒）。别用 startup_timeout（默认 120）——
+#: 工具调用跑在工作线程里，等太久会把这一轮回复拖死。
+_RELOAD_TIMEOUT = 30.0
+
+
+def _reload_servers(target: str = "") -> str:
+    """按磁盘最新配置重建 MCP server —— **不重启整个程序**。
+
+    - `target=""`    ：全部重建
+    - `target="xxx"` ：只重建这一个
+
+    ⚠️ 与 `/plugin_reload` 的区别：这里会**真正停掉旧 server**
+    （置 `_stop` → 等常驻协程收尾 → 传输上下文随之关闭子进程/连接），
+    再按配置重建；不会像全量重载那样留下孤儿线程与子进程。
+    """
+    global _LOOP
+    _ensure_bootstrap()                      # 保证 _LOOP 已建（首次调用时）
+    for _ in range(100):                     # 等 _bootstrap 把 _LOOP 建好
+        if _LOOP is not None:
+            break
+        threading.Event().wait(0.05)
+
+    cfg = _load_config()
+    entries: Dict[str, dict] = {}
+    for entry in _server_entries(cfg):
+        name = str(entry.get("name") or "").strip()
+        if name:
+            entries[name] = entry
+
+    if target:
+        if target not in entries:
+            avail = ", ".join(sorted(entries)) or "无"
+            return f" 配置里没有 server `{target}`（可用：{avail}）"
+        wanted = {target: entries[target]}
+    else:
+        wanted = entries
+
+    # ── 停掉要重建的（全量=全部；单目标=只停目标）──
+    stopped: List[_Server] = []
+    if target:
+        old = _SERVERS.pop(target, None)
+        if old is not None:
+            stopped.append(old)
+    else:
+        stopped = list(_SERVERS.values())
+        _SERVERS.clear()
+    for srv in stopped:
+        srv.stop()
+    for srv in stopped:
+        if not srv.wait_closed(5.0):
+            print(f" [mcp_client] server [{srv.name}] 旧会话未在 5s 内退出（继续重建）")
+
+    if _LOOP is None:                        # 极端兜底：bootstrap 还没建循环
+        _LOOP = _Loop()
+
+    timeout = min(float((cfg.get("settings") or {}).get("startup_timeout", 120) or 120),
+                  _RELOAD_TIMEOUT)
+    lines: List[str] = []
+    for name, entry in wanted.items():
+        if not entry.get("enabled", True):
+            lines.append(f"- [{name}] 已禁用，跳过")
+            continue
+        server = _Server(name, entry, _LOOP)
+        _SERVERS[name] = server
+        try:
+            server.start(timeout)
+        except Exception as exc:
+            server.error = _describe_exception(exc)
+        if server.tools:
+            lines.append(f"- [{name}] 就绪（{server.transport()}），"
+                         f"工具 {len(server.tools)} 个")
+        else:
+            lines.append(f"- [{name}] 不可用：{server.error}")
+    if not lines:
+        lines.append("（没有启用的 server）")
+    scope = f"`{target}`" if target else "全部"
+    return f" MCP 已重载（{scope}）：\n" + "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -381,7 +709,7 @@ def call_dynamic_tool(tool_name: str, arguments: dict) -> str:
     try:
         result = server.call(raw, dict(arguments or {}), timeout)
     except Exception as exc:
-        return f" 调用 MCP 工具 {tool_name} 失败：{type(exc).__name__}: {exc}"
+        return f" 调用 MCP 工具 {tool_name} 失败：{_describe_exception(exc)}"
     return _render_result(result)
 
 
@@ -411,29 +739,30 @@ def mcp_status() -> str:
     """查看 MCP 连接状态、可用工具与受限工具。"""
     _ensure_bootstrap()
     cfg = _load_config()
-    if not cfg:
-        return (f" 未读到 config/mcp.toml（路径：{app_path(*CONFIG_PARTS)}），"
-                f"MCP 客户端未启用。")
+    entries = _server_entries(cfg)
+    if not entries:
+        return (f" 未读到 MCP server 配置（mcp.toml 路径：{app_path(*CONFIG_PARTS)}；"
+                f"也可用标准格式的 {app_path(*JSON_CONFIG_PARTS)}），MCP 客户端未启用。")
     if not (cfg.get("settings") or {}).get("enabled", True):
         return " MCP 客户端已在 config/mcp.toml 的 [settings].enabled 中关闭。"
 
     if not _BOOTSTRAP_DONE.is_set():
         lines = ["MCP 正在后台启动中（首次跑 npx 要下载包，可能需 30-60 秒），请稍后再查。"]
-        for name in (cfg.get("servers") or []):
-            if isinstance(name, dict) and name.get("name"):
-                lines.append(f"  - {name['name']}")
+        for entry in entries:
+            if entry.get("name"):
+                lines.append(f"  - {entry['name']}")
         return "\n".join(lines)
 
     if not _SERVERS:
-        return " config/mcp.toml 里没有启用的 server。"
+        return " 配置里没有启用的 server。"
 
     grants = _load_grants()
     lines = ["【MCP 状态】"]
     for name, server in _SERVERS.items():
         if server.tools:
-            lines.append(f"- [{name}] 就绪，工具 {len(server.tools)} 个")
+            lines.append(f"- [{name}] 就绪（{server.transport()}），工具 {len(server.tools)} 个")
         else:
-            lines.append(f"- [{name}] 不可用：{server.error}")
+            lines.append(f"- [{name}] 不可用（{server.transport()}）：{server.error}")
         disabled = _disabled_of(server)
         if disabled:
             lines.append(f"    受限工具（默认禁用）：{', '.join(sorted(disabled))}")
@@ -512,6 +841,133 @@ def mcp_tool_access(tool: str = "", reason: str = "",
 
 
 # ═══════════════════════════════════════════════════════════
+# 配置编辑 / 重载（让妹抖酱能自己排查、自己改）
+# ═══════════════════════════════════════════════════════════
+
+#: 允许写进 mcp_servers.json 的字段（其余一律丢弃，避免塞进奇怪东西）
+_SPEC_KEYS = ("type", "command", "args", "url", "headers", "env",
+              "enabled", "disabled_tools", "allowed_tools")
+
+
+def _normalize_spec(spec: Any) -> Tuple[Optional[dict], Optional[str]]:
+    """校验并规整一个 server 配置；返回 `(clean, error)`，二者必有一为 None。"""
+    if not isinstance(spec, dict):
+        return None, "spec 必须是对象"
+    clean = {k: spec[k] for k in _SPEC_KEYS if k in spec}
+    kind = str(clean.get("type") or "stdio").strip().lower()
+    if kind in _HTTP_ALIASES:
+        kind = "http"
+    elif kind not in ("stdio", "sse"):
+        return None, f"type 只能是 stdio / http / sse，收到 {clean.get('type')!r}"
+    clean["type"] = kind
+    if kind == "stdio":
+        if not str(clean.get("command") or "").strip():
+            return None, "stdio 必须提供 command"
+        if "args" in clean and not isinstance(clean["args"], list):
+            return None, "args 必须是数组"
+    elif not str(clean.get("url") or "").strip():
+        return None, f"{kind} 必须提供 url"
+    for key in ("headers", "env"):
+        if key in clean and not isinstance(clean[key], dict):
+            return None, f"{key} 必须是对象"
+    return clean, None
+
+
+def _spec_preview(name: str, spec: dict) -> str:
+    kind = str(spec.get("type") or "stdio").strip().lower()
+    if kind in ("http", "sse"):
+        body = f"type={kind} url={spec.get('url')!r}"
+        if spec.get("headers"):
+            body += f" headers={list(spec['headers'])}"
+    else:
+        body = (f"type=stdio command={spec.get('command')!r} "
+                f"args={spec.get('args') or []}")
+    return f"`{name}` → {body}"
+
+
+def mcp_restart(server: str = "") -> str:
+    """按磁盘最新配置重建 MCP server（**不重启整个程序**）。
+
+    改完 `config/mcp.toml` 或 `config/mcp_servers.json` 后调用即可生效；
+    server 卡死/启动失败要重试时也用它。不带参数重建全部，带名字只重建那一个。
+    旧 server 会被真正停掉（含子进程），不会像全量重载那样泄漏。
+    """
+    return _reload_servers((server or "").strip())
+
+
+def mcp_config(action: str = "list", server: str = "",
+               spec: Optional[dict] = None, confirm: bool = False) -> str:
+    """查看 / 增改 / 删除 MCP server 配置（只写 config/mcp_servers.json）。
+
+    - `action="list"`  ：列出所有 server 及其来源（toml / json）
+    - `action="add"`   ：新增或覆盖 `server`（需 `spec`）
+    - `action="remove"`：删除 `server`
+
+    写文件前先返回申请文本，用户同意后再带 `confirm=true` 调一次；写完自动重载。
+    ⚠️ 不代改 `config/mcp.toml`（用户手写，程序重写会丢注释）。
+    """
+    _ensure_bootstrap()
+    action = (action or "list").strip().lower()
+    server = (server or "").strip()
+    cfg = _load_config()
+    sources = _server_sources(cfg)
+    entries = {str(e.get("name") or "").strip(): e for e in _server_entries(cfg)}
+
+    if action == "list":
+        if not sources:
+            return " 当前没有任何 MCP server。"
+        lines = ["【MCP server 配置】"]
+        for name in sorted(sources):
+            entry = entries.get(name, {})
+            state = "启用" if entry.get("enabled", True) else "禁用"
+            lines.append(f"- {_spec_preview(name, entry)}（{state}，来自 {sources[name]}）")
+        return "\n".join(lines)
+
+    if action not in ("add", "update", "remove"):
+        return f" 未知 action：{action}（可用：list / add / remove）"
+    if not server:
+        return " 请提供 server 名称。"
+
+    raw = _load_json_raw()
+
+    if action == "remove":
+        if server not in raw:
+            extra = ("（它在 mcp.toml 里，程序不代改手写文件）"
+                     if sources.get(server) == "toml" else "")
+            return f" `{server}` 不在 config/mcp_servers.json 里{extra}。"
+        if not confirm:
+            return ("【配置修改申请】\n"
+                    f"要从 config/mcp_servers.json 删除 server `{server}`。\n"
+                    "（原文件会先备份为 mcp_servers.json.bak）\n\n"
+                    "同意的话请回复，我再带 confirm=true 执行。")
+        raw.pop(server, None)
+        path = _save_json_servers(raw)
+        return f" 已从 {path.name} 删除 `{server}`。\n{_reload_servers(server)}"
+
+    # add / update
+    if not spec:
+        return " add/update 需要 spec（stdio：command/args；http：url/headers）。"
+    clean, err = _normalize_spec(spec)
+    if err:
+        return f" spec 不合法：{err}"
+
+    shadow = ""
+    if sources.get(server) == "toml":
+        shadow = (f"⚠️ `{server}` 已在 config/mcp.toml 里定义，**TOML 优先**，"
+                  f"写进 JSON 不会生效；要改它请直接改 mcp.toml。\n")
+
+    if not confirm:
+        return ("【配置修改申请】\n"
+                f"将写入 config/mcp_servers.json：\n  {_spec_preview(server, clean)}\n"
+                "（原文件会先备份为 mcp_servers.json.bak）\n"
+                f"{shadow}\n同意的话请回复，我再带 confirm=true 执行。")
+
+    raw[server] = clean
+    path = _save_json_servers(raw)
+    return f" 已写入 {path.name}。\n{shadow}{_reload_servers(server)}"
+
+
+# ═══════════════════════════════════════════════════════════
 # 插件注册
 # ═══════════════════════════════════════════════════════════
 
@@ -521,4 +977,6 @@ def register_commands():
     return {
         "/mcp_status": mcp_status,
         "/mcp_tool_access": mcp_tool_access,
+        "/mcp_restart": mcp_restart,
+        "/mcp_config": mcp_config,
     }

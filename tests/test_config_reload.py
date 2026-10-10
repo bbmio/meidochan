@@ -389,6 +389,11 @@ def _main_window_stub(engine):
             self.reload_calls.append(True)
             return self.l2d_ok
 
+        def _sync_risk_button(self):
+            """no-op：本文件只测「按段分发」，输入框旁权限按钮的同步由
+            tests/test_risk_toggle.py 覆盖。"""
+            return None
+
     return _Win()
 
 

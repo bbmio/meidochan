@@ -235,17 +235,24 @@ class TestPluginsTab:
         dialog._save_plugins()
         assert seen == ["plugins"]
 
-    def test_risk_switch_defaults_unchecked(self, dialog):
-        """总开关默认关闭（真实 config/plugins.toml 里 allow_risky_tools = false）。"""
-        assert dialog.allow_risky_check.isChecked() is False
+    def test_risk_switch_reflects_config(self, dialog):
+        """勾选框回填自真实 config/plugins.toml。
+
+        ⚠️ 不要写死默认值：`allow_risky_tools` 已改为默认 true（2026-10-04），
+        且输入框旁的「权限等级」按钮也会改它 —— 这里只断言「回填一致」。
+        """
+        expected = bool(dialog._engine.config.get_plugins_config().allow_risky_tools)
+        assert dialog.allow_risky_check.isChecked() is expected
 
     def test_toggle_only_emits_tool_policy(self, dialog, captured):
         """只改风险开关：写入配置，但发 tool_policy 而不是 plugins（不重启插件）。"""
         seen = []
         dialog.config_saved.connect(seen.append)
-        dialog.allow_risky_check.setChecked(True)
+        # 必须真的"改动"开关（真实配置值可变，不能写死方向）
+        target = not dialog.allow_risky_check.isChecked()
+        dialog.allow_risky_check.setChecked(target)
         dialog._save_plugins()
-        assert captured["plugins"].allow_risky_tools is True
+        assert captured["plugins"].allow_risky_tools is target
         assert seen == ["tool_policy"]
 
     def test_plugin_edits_still_reload(self, dialog, captured):

@@ -21,6 +21,10 @@ config/apikey.local
 .env.*
 !.env.example
 
+# MCP 标准 mcpServers 配置：常含 x-mcp-key 等凭据，绝不入库
+# ⚠️ 打包时 build.bat 会整份 xcopy config/，发布前记得清掉这个文件
+config/mcp_servers.json
+
 # ═══════════════════════════════════════════════════════════
 # Python
 # ═══════════════════════════════════════════════════════════

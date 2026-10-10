@@ -1,9 +1,18 @@
 # ── MCP 客户端配置 ──
 #
-# 妹抖酱作为 MCP 客户端，连接外部 MCP server（stdio 协议），
-# 把对方提供的工具动态注册给 AI。工具名会加 `<server名>__` 前缀，避免与现有插件重名。
+# 妹抖酱作为 MCP 客户端，连接外部 MCP server，把对方提供的工具动态注册给 AI。
+# 工具名会加 `<server名>__` 前缀，避免与现有插件重名。
 #
-# 每个 [[servers]] 一项。改完需要重启妹抖酱（插件在启动时加载）。
+# 支持三种传输（每个 [[servers]] 的 type 字段，默认 stdio）：
+#   - stdio：本地进程，配 command + args（可选 env）
+#   - http ：Streamable HTTP，配 url（可选 headers）—— 现代远程/本地 HTTP MCP 用这个
+#   - sse  ：旧式 SSE，配 url（可选 headers）
+#
+# 另外：可把**标准 `mcpServers` 格式**的 JSON 放进 config/mcp_servers.json
+# （Claude Desktop / Cursor 那种，直接粘贴即可），其条目会与本文件合并；
+# 同名时以本文件为准。该 JSON 常含密钥，已加入 .gitignore，不会进仓库。
+#
+# 改完需要重启妹抖酱（插件在启动时加载）。
 
 [settings]
 enabled = true
@@ -11,8 +20,10 @@ enabled = true
 startup_timeout = 120
 # 单次工具调用超时（秒）。浏览器导航等操作可能较慢。
 call_timeout = 120
+# HTTP / SSE 传输的连接超时（秒）；SSE 读取超时固定 300s。
+http_timeout = 30
 
-# ── Playwright 浏览器 MCP ──
+# ── Playwright 浏览器 MCP（stdio）──
 # 提供 25 个浏览器工具：导航 / 点击 / 输入 / 截图 / 无障碍树快照 /
 # 多标签 / 网络监控 / Cookie 与存储状态 等。
 #
@@ -26,6 +37,7 @@ call_timeout = 120
 [[servers]]
 name = "playwright"
 enabled = true
+type = "stdio"
 command = "npx"
 # --output-dir 放在 data/ 下（该目录已在 .gitignore 里），避免快照文件散落到项目根目录。
 # 相对路径以项目根为基准（插件会把子进程 cwd 固定为项目根）。
@@ -35,3 +47,11 @@ args = ["-y", "@playwright/mcp@latest", "--output-dir=data/mcp_output"]
 # browser_run_code_unsafe 能在浏览器进程里跑任意 Playwright JS，等价于远程代码执行，
 # 所以默认不给。妹抖酱需要时得先用 mcp_tool_access 向你申请，你同意后才解锁。
 disabled_tools = ["browser_run_code_unsafe"]
+
+# ── HTTP / SSE server 示例（取消注释并填 url 即可）──
+# [[servers]]
+# name = "utools"
+# enabled = true
+# type = "http"                                  # 或 "sse"
+# url = "http://127.0.0.1:3501/mcp"
+# headers = { "x-mcp-key" = "把密钥填这里" }

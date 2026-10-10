@@ -181,6 +181,17 @@ class _TitleBar(QWidget):
 class MainWindow(QWidget):
     """主窗口：装配侧栏 / 聊天区 / 舞台，并接管全部事件。"""
 
+    #: 主窗口的窗口 flags。
+    #:
+    #: ⚠️ `WindowMinimizeButtonHint` **不能少**：无边框窗口在 Windows 上默认是
+    #: `WS_POPUP` 且**没有 `WS_MINIMIZEBOX`**，于是任务栏按钮不会执行
+    #: 「最小化 / 还原」—— 表现为「单击任务栏图标没反应」（用户实测报的）。
+    #: 实测加上它之后原生样式变成 `SYSMENU=True, MINIMIZEBOX=True`，
+    #: 且因为是 Frameless，界面外观完全不变（不会多出标题栏按钮）。
+    WINDOW_FLAGS = (Qt.WindowType.FramelessWindowHint
+                    | Qt.WindowType.Window
+                    | Qt.WindowType.WindowMinimizeButtonHint)
+
     def __init__(self, engine, bridge, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.engine = engine
@@ -227,7 +238,7 @@ class MainWindow(QWidget):
 
         self.setWindowTitle(APP_DISPLAY)
         self.setWindowIcon(_app_icon())
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
+        self.setWindowFlags(self.WINDOW_FLAGS)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
         self.setMinimumSize(980, 640)
@@ -388,6 +399,7 @@ class MainWindow(QWidget):
         self.chat.history_load_requested.connect(self._on_history_load)
         self.chat.new_session_requested.connect(self._on_new_session)
         self.chat.export_requested.connect(self._on_export)
+        self.chat.risk_policy_changed.connect(self._on_risk_policy_changed)
 
         self.stage_panel.blur_changed.connect(self._on_blur_changed)
         self.stage_panel.window_opacity_changed.connect(self._on_window_opacity)
@@ -428,9 +440,7 @@ class MainWindow(QWidget):
         menu.addSeparator()
         menu.addAction(quit_action)
         self.tray.setContextMenu(menu)
-        self.tray.activated.connect(
-            lambda reason: self._restore_from_tray()
-            if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
+        self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
 
     def _load_assets(self) -> None:
@@ -759,6 +769,7 @@ class MainWindow(QWidget):
         self._probe_local_models()
         self.status_model.setText(f"模型：{self.engine.brain.current_model}")
         self.sidebar.set_status("")
+        self._sync_risk_button()
         self.run_startup_selfcheck()
         self.chat.input.setFocus()
 
@@ -1301,9 +1312,41 @@ class MainWindow(QWidget):
             self.sidebar.set_status("插件已按新开关重新加载")
         elif section == "tool_policy":
             # 只改了风险工具开关：不重建插件（MCP 子进程不动），下一次调用实时生效
+            self._sync_risk_button()
             self.sidebar.set_status("风险工具开关已保存并生效")
         elif section == "live2d":
             self._reload_live2d_stand()
+
+    # ── 权限等级（高风险工具总开关）──
+
+    def _sync_risk_button(self) -> None:
+        """把输入框旁按钮的显示对齐到配置里的真实值。"""
+        try:
+            enabled = bool(self.engine.config.get_plugins_config().allow_risky_tools)
+        except Exception as exc:
+            print(f"  [权限] 读取 allow_risky_tools 失败，按「普通」显示: {exc}")
+            enabled = False
+        self.chat.set_risk_policy(enabled)
+
+    def _on_risk_policy_changed(self, enabled: bool) -> None:
+        """输入框旁「权限等级」按钮：切换高风险工具总开关并立即持久化。
+
+        `engine._allow_risky_tools()` 每轮实时读配置，所以保存后**下一轮即生效**，
+        不需要重载插件（MCP 子进程不受影响）。
+        """
+        try:
+            cfg = self.engine.config.get_plugins_config()
+            cfg.allow_risky_tools = bool(enabled)
+            self.engine.config.save_plugins_config(cfg)
+        except Exception as exc:
+            self.chat.set_risk_policy(not enabled)      # 保存失败 → 按钮回滚
+            self.sidebar.set_status(f"权限开关保存失败：{exc}")
+            return
+        self.chat.set_risk_policy(enabled)
+        self.sidebar.set_status(
+            "高风险工具已启用：AI 可自动写/删文件、调用受限工具"
+            if enabled else
+            "高风险工具已禁用：AI 不会再自动执行高风险操作")
 
     def _reload_live2d_stand(self) -> None:
         """按新的 live2d.toml 重新装配立绘（重建 WebEngine，约 1~3 秒）。
@@ -1570,8 +1613,30 @@ class MainWindow(QWidget):
         self.pin_btn.setToolTip("已置顶：窗口始终浮在最前（再点一次取消）" if checked
                                 else "让窗口始终浮在最前")
 
+    def _on_tray_activated(self, reason) -> None:
+        """托盘图标被点击：单击 = 切换「弹出 / 收回」。
+
+        Windows 上单击是 `Trigger`；双击会**另外**再补一个 `DoubleClick`，
+        而第一次点击的 `Trigger` 已经派发过了 —— 两处都接会在双击时切换两次、
+        等于没动，所以这里**只认 `Trigger`**。
+        """
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._toggle_from_tray()
+
+    def _toggle_from_tray(self) -> None:
+        """窗口在屏幕上就收回，否则弹出（用户要的「弹出 / 收回」）。"""
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self._restore_from_tray()
+
     def _restore_from_tray(self) -> None:
-        self.showNormal()
+        """从托盘弹出窗口（并尽量提到最前）。"""
+        self.show()
+        # ⚠️ 不能直接用 showNormal()：那会把「最大化」状态一并清掉，
+        #    用户最大化后最小化到托盘、再点回来会变成小窗。
+        if self.windowState() & Qt.WindowState.WindowMinimized:
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
         self.raise_()
         self.activateWindow()
 
