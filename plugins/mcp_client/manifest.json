@@ -4,7 +4,7 @@
     "type": "tool",
     "entry": "main.py",
     "author": "ShiKi",
-    "description": "MCP 客户端：连接外部 MCP server（stdio），把对方工具动态注册给 AI。默认禁用高风险工具，妹抖酱需向用户申请并获同意后才能启用。",
+    "description": "MCP 客户端：连接外部 MCP server（stdio / Streamable HTTP / SSE），把对方工具动态注册给 AI。默认禁用高风险工具，妹抖酱需向用户申请并获同意后才能启用。",
 
     "─── 说明 ──────────────────────────────": "",
     "# server 列表与参数在 config/mcp.toml，不在本文件": "",
@@ -51,6 +51,48 @@
                     }
                 },
                 "required": []
+            }
+        },
+        {
+            "name": "mcp_restart",
+            "description": "按磁盘最新配置重建 MCP server，不重启整个程序。改完 config/mcp.toml 或 config/mcp_servers.json 后调用即可生效；server 启动失败或卡死要重试时也用它。不带参数重建全部，带 server 名只重建那一个。旧 server 会被真正停掉（含子进程）。可能耗时数秒。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "description": "要重建的 server 名。留空则重建全部。"
+                    }
+                },
+                "required": []
+            }
+        },
+        {
+            "name": "mcp_config",
+            "risk": "high",
+            "description": "查看 / 增改 / 删除 MCP server 配置（只写 config/mcp_servers.json，不碰 mcp.toml）。action=list 列出全部；action=add 配合 spec 新增或覆盖；action=remove 删除。写文件前会先返回申请文本，须向用户说明并征得同意后再带 confirm=true 调一次，写完自动重载。注意：能定义任意 stdio 命令，等价于可执行本地程序，属高风险。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "add", "remove"],
+                        "description": "list=查看，add=新增/覆盖，remove=删除。"
+                    },
+                    "server": {
+                        "type": "string",
+                        "description": "server 名称。list 时可省略。"
+                    },
+                    "spec": {
+                        "type": "object",
+                        "description": "server 配置。stdio 用 {type,command,args,env}；http/sse 用 {type,url,headers}。可选 enabled / disabled_tools。"
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "用户已明确同意后的第二步；未获同意前不要设为 true。"
+                    }
+                },
+                "required": ["action"]
             }
         }
     ]
