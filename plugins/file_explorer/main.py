@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import difflib
 import fnmatch
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime
+from typing import Optional
 import mimetypes
 
 from core.paths import APP_DIR, app_path
@@ -22,27 +24,67 @@ DEFAULT_VIEW_LINES = 100
 MAX_FULL_CONTENT = 100000
 
 # ── 白名单加载 ──
+
+#: 常见「用户文件夹」在注册表 `User Shell Folders` 里的值名。
+#: ⚠️ 为什么要绕注册表：OneDrive 会把桌面 / 文档 / 图片**重定向**到
+#: `C:\Users\<名>\OneDrive\...`，这时 `Path.home()/Desktop` **根本不存在** ——
+#: 而白名单会**静默跳过不存在的路径**，于是「桌面」这条悄悄失效、没人知道。
+_SHELL_FOLDERS = {
+    "desktop": "Desktop",
+    "documents": "Personal",
+    "downloads": "{374DE290-123F-4565-9164-39C4925E467B}",
+    "pictures": "My Pictures",
+}
+
+
+def _shell_folder(name: str) -> Optional[Path]:
+    """取 Windows「用户文件夹」的真实路径（兼容 OneDrive 重定向）。
+
+    取不到（非 Windows / 无该键 / 路径不存在）返回 None，调用方回退 `Path.home()`。
+    """
+    key_name = _SHELL_FOLDERS.get((name or "").lower())
+    if not key_name or sys.platform != "win32":
+        return None
+    try:
+        import winreg
+        sub = (r"Software\Microsoft\Windows\CurrentVersion"
+               r"\Explorer\User Shell Folders")
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub) as key:
+            raw, _ = winreg.QueryValueEx(key, key_name)
+        path = Path(os.path.expandvars(str(raw)))
+        return path if path.exists() else None
+    except (OSError, ValueError, ImportError):
+        return None
+
+
 def load_whitelist():
     manifest_path = Path(__file__).parent / "manifest.json"
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
     config = manifest.get("config", {})
     whitelist_raw = config.get("whitelist", [])
-    
+
     resolved = []
     for p in whitelist_raw:
         # 展开环境变量；${PROJECT_DIR} 指妹抖酱自己的项目目录（与本插件所在目录同级）
         expanded = os.path.expandvars(p).replace("${PROJECT_DIR}", str(APP_DIR))
         path = Path(expanded)
-        # 相对路径  基于插件目录解析
         if not path.is_absolute():
-            path = (Path.home() / path).resolve()
+            # 相对路径基于用户主目录；但 Desktop/Documents/... 可能被 OneDrive 重定向，
+            # 优先取注册表里的真实位置，取不到才退回 Path.home()
+            parts = path.parts
+            real = _shell_folder(parts[0]) if parts else None
+            path = ((real.joinpath(*parts[1:])) if real is not None
+                    else (Path.home() / path)).resolve()
         else:
             path = path.resolve()
         if path.exists():
             resolved.append(path)
         else:
-            print(f" [file_explorer] 白名单路径不存在，已忽略: {path}")
+            print(f" [file_explorer] 白名单路径不存在，已忽略: {path}"
+                  f"（原始配置：{p!r}）")
+    if not resolved:
+        print(" [file_explorer] 警告：白名单为空，所有文件操作都会被拒绝")
     return resolved
 
 WHITELIST = load_whitelist()
@@ -57,6 +99,42 @@ def is_allowed(target: Path) -> bool:
         except ValueError:
             continue
     return False
+
+# ── 读拒绝名单 ──
+#: 即使目标落在白名单内，也**不允许读内容**的文件（ls 只列名字，不算「读」）。
+#: 目的：这些文件含密钥 / 凭据，一旦读出来就会进工具返回 → 对话上下文（发往模型服务商）
+#: 与日志。实测发生过：AI 读了配置，密钥随工具结果进了上下文与日志。
+#: ⚠️ 基线**硬编码在这里**、不放进 manifest —— 否则「能改配置」就等于能解除自己的读限制。
+_READ_DENY_NAMES = (
+    "*.local",                   # apikey.local 等本地密钥
+    ".env", ".env.*",            # 环境变量文件
+    "mcp_servers.json",          # MCP server 的密钥
+    "conversation_memory.json",  # 可能含历史对话
+)
+_READ_DENY_PATHS = (
+    "*/config/adapters.toml",
+    "*/searxng/settings.yml",
+    "*/qq/config.toml",
+)
+
+
+def is_sensitive(target: Path) -> bool:
+    """是否命中读拒绝名单（含密钥 / 凭据的文件）。"""
+    name = target.name.lower()
+    if any(fnmatch.fnmatch(name, pat) for pat in _READ_DENY_NAMES):
+        return True
+    norm = str(target).replace("\\", "/").lower()
+    return any(fnmatch.fnmatch(norm, pat) for pat in _READ_DENY_PATHS)
+
+
+def is_readable(target: Path) -> bool:
+    """读权限 = 在白名单内 且 不在读拒绝名单里。"""
+    return is_allowed(target) and not is_sensitive(target)
+
+
+#: 命中读拒绝名单时统一返回的说明（不泄露文件内容，也告诉用户该怎么办）
+_SENSITIVE_MSG = (" 出于安全考虑，这个文件不允许读取（它可能含有密钥 / 凭据）。"
+                  "请你自己用记事本打开查看。")
 
 # 常见文本扩展名
 TEXT_EXTENSIONS = {
@@ -126,6 +204,8 @@ def get_file_info(arg: str) -> str:
     file = Path(arg).resolve()
     if not is_allowed(file):
         return " 权限不足。"
+    if is_sensitive(file):
+        return _SENSITIVE_MSG
     if not file.exists():
         return f" 文件不存在: {file}"
     if file.is_dir():
@@ -234,6 +314,8 @@ def preview_text(arg: str, default_lines: int = DEFAULT_VIEW_LINES) -> str:
 
     if not is_allowed(file):
         return " 权限不足。"
+    if is_sensitive(file):
+        return _SENSITIVE_MSG
     if not file.exists():
         return f" 文件不存在: {file}"
     if file.is_dir():

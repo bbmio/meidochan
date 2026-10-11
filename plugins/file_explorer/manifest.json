@@ -13,6 +13,8 @@
     "# 支持环境变量展开，如 ${MY_FOLDER}": "",
     "# 也支持绝对路径，如 C:/MyData": "",
     "# 读（ls/view/info）与写（write_file/edit_file/delete_file）共用这份白名单": "",
+    "# ⚠️ 读保护：apikey.local / *.local / .env / mcp_servers.json 等含密钥的文件，": "",
+    "#   即使落在白名单内也**不允许读内容**（基线在 main.py 里硬编码，改这里也解不开）": "",
 
     "config": {
         "whitelist": [
@@ -23,7 +25,7 @@
         "─── 写入能力配置 ──────────────────────────────": "",
         "write": {
             "enabled": true,
-            "require_confirm": false,
+            "require_confirm": true,
             "allow_delete": true,
             "backup_dir": ".meido_backups",
             "max_backups": 5,

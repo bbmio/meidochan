@@ -32,6 +32,50 @@ from core.paths import app_path
 from core.tool_outputs import page_out
 
 
+# ═══════════════════════════════════════════════════════════
+# 日志脱敏
+#
+# 工具调用参数会**原样进日志**（`data/logs/*.log`，见下面 `调用工具:` 那行），
+# 而日志是排障时最常被分享的东西。实测发生过泄漏：妹抖酱把 MCP 的
+# `x-mcp-key` 当参数传给 `edit_file` / `playwright__browser_evaluate`，
+# 于是真密钥永久留在了日志文件里。打印前统一遮蔽。
+# ═══════════════════════════════════════════════════════════
+MASK = "***已隐藏***"
+
+#: 参数「键名」命中即遮蔽整个值（大小写不敏感，子串匹配）
+_SECRET_KEY_HINTS = (
+    "key", "token", "secret", "password", "passwd", "credential",
+    "authorization", "auth", "apikey", "api_key", "cookie", "session",
+)
+
+#: 参数「值」命中即遮蔽（常见密钥形态；长 hex 覆盖 32 位的 MCP key）
+_SECRET_VALUE_RE = re.compile(
+    r"(sk-[A-Za-z0-9_\-]{16,}"
+    r"|ghp_[A-Za-z0-9]{20,}"
+    r"|AIza[A-Za-z0-9_\-]{30,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{10,}"
+    r"|(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9]))"
+)
+
+
+def redact_secrets(value: Any, _key: str = "") -> Any:
+    """递归遮蔽工具参数里的密钥，返回可直接打印的安全副本。
+
+    - 键名含 key/token/secret/... → 整个值换成 MASK
+    - 字符串值命中密钥形态（sk-/ghp_/长 hex 等）→ 命中片段换成 MASK
+    只读地构造副本，不改原对象（后续工具执行仍用原参数）。
+    """
+    if isinstance(value, dict):
+        return {k: redact_secrets(v, str(k)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_secrets(v, _key) for v in value]
+    if isinstance(value, str):
+        if _key and any(h in _key.lower() for h in _SECRET_KEY_HINTS):
+            return MASK
+        return _SECRET_VALUE_RE.sub(MASK, value)
+    return value
+
+
 def _load_user_id(config_loader: ConfigLoader) -> str:
     """user_id 优先级：环境变量 > user_config.json > 主机名"""
     env_id = os.getenv("DEEPSEEK_USER_ID")
@@ -1051,7 +1095,7 @@ class Brain:
                 ev = _phase_event("tool")
                 if ev:
                     yield ev
-                print(f" [鲸鱼娘] 调用工具: {func_name}({arguments})")
+                print(f" [鲸鱼娘] 调用工具: {func_name}({redact_secrets(arguments)})")
 
                 if func_name not in SAFE_REPEAT_TOOLS:
                     arg_fp = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
@@ -1074,7 +1118,7 @@ class Brain:
                         result_box["result"] = tool_executor(func_name, arguments)
                     except Exception as e:
                         result_box["error"] = f" 工具执行异常: {e}"
-                        print(f" 工具 {func_name} 执行错误: {e}")
+                        print(f" 工具 {func_name} 执行错误: {redact_secrets(str(e))}")
                         traceback.print_exc()
 
                 t = threading.Thread(target=_run_tool, daemon=True)
